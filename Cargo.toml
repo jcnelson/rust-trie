@@ -1,0 +1,16 @@
+[package]
+name = "rust-trie"
+version = "0.0.1"
+authors = ["Jude Nelson <judecn@gmail.com>"]
+license = "GPLv3"
+homepage = "https://github.com/jcnelson/rust-trie"
+repository = "https://github.com/jcnelson/rust-trie"
+description = "Rust trie tests"
+keywords = [ "data structure", "trie" ]
+readme = "README.md"
+
+[dependencies]
+rand = "0.5"
+sha2 = "0.8.0"
+serde = "1"
+serde_derive = "1"
