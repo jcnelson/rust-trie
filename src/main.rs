@@ -13,6 +13,9 @@ extern crate rand;
 
 use std::env;
 use std::process;
+use std::io::{Read,Write,Seek,Error,ErrorKind};
+
+use util::*;
 
 fn main() {
     let argv : Vec<String> = env::args().collect();
@@ -22,6 +25,16 @@ fn main() {
     }
 
     match argv[1].as_str() {
+        "dump_trie" => {
+            if argv.len() != 4 {
+                eprintln!("Usage: {} dump_trie /path/to/marf block_header_hash", argv[0]);
+                process::exit(1);
+            }
+            let mut storage = TrieFileStorage::new(&argv[2]).unwrap();
+            let bhh = BlockHeaderHash::from_hex(&argv[3]).unwrap();
+            storage.open(&bhh, false).unwrap();
+            print_trie(&mut storage);
+        },
         _ => {
             eprintln!("Usage: {} do-stuff ...", argv[0]);
             process::exit(1);
