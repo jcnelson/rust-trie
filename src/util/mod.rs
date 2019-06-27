@@ -399,15 +399,20 @@ pub const BLOCK_HEADER_HASH_ENCODED_SIZE : u32 = 32;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Fast log-base-2 floor of a u64.
+/// Finds the offset of the highest bit set and returns it.
 #[inline]
 fn log2_floor(k: u64) -> u64 {
-    let mut r = 0;
-    for i in 0..64 {
-        if k & (1u64 << i) != 0 {
-            r = i;
+    let mut r = 63;
+    let mut mask = 1u64 << 63;
+    while r > 0 {
+        if (k & mask) != 0 {
+            return r;
         }
+        r -= 1;
+        mask >>= 1;
     }
-    r as u64
+    0
 }
 
 
@@ -613,12 +618,14 @@ pub fn ptrs_fmt(ptrs: &[TriePtr]) -> String {
 pub const TRIEPTR_SIZE : usize = 10;
 
 impl Default for TriePtr {
+    #[inline]
     fn default() -> TriePtr {
         TriePtr { id: 0, chr: 0, ptr: 0 }
     }
 }
 
 impl TriePtr {
+    #[inline]
     pub fn new(id: u8, chr: u8, ptr: u64) -> TriePtr {
         TriePtr {
             id: id,
@@ -627,22 +634,27 @@ impl TriePtr {
         }
     }
 
+    #[inline]
     pub fn empty(&self) -> bool {
         self.id == 0
     }
 
+    #[inline]
     pub fn id(&self) -> u8 {
         self.id
     }
 
+    #[inline]
     pub fn chr(&self) -> u8 {
         self.chr
     }
 
+    #[inline]
     pub fn ptr(&self) -> u64 {
         self.ptr
     }
 
+    #[inline]
     pub fn to_bytes(&self, buf: &mut Vec<u8>) -> () {
         let ptr = self.ptr();
 
@@ -670,12 +682,14 @@ impl TriePtr {
         buf.push(ptr_bytes[7]);
     }
 
+    #[inline]
     pub fn to_consensus_bytes(&self, buf: &mut Vec<u8>) -> () {
         // like to_bytes(), but without insertion-order
         buf.push(self.id());
         buf.push(self.chr());
     }
 
+    #[inline]
     pub fn from_bytes(bytes: &[u8]) -> TriePtr {
         assert!(bytes.len() >= TRIEPTR_SIZE);
         let id = bytes[0];
@@ -705,7 +719,8 @@ pub struct TrieCursor {
     node_path_index: usize,     // index into the currently-visited node's compressed path
     nodes: Vec<TrieNodeType>,   // list of nodes this cursor visits
     node_ptrs: Vec<TriePtr>,    // list of ptr branches this cursor has taken
-    block_hashes: Vec<BlockHeaderHash>  // (optional) list of Tries we've visited.  block_hashes[i] corresponds to node_ptrs[i]
+    block_hashes: Vec<BlockHeaderHash>,  // (optional) list of Tries we've visited.  block_hashes[i] corresponds to node_ptrs[i]
+    diverged: bool
 }
 
 impl TrieCursor {
@@ -717,6 +732,7 @@ impl TrieCursor {
             nodes: vec![],
             node_ptrs: vec![TriePtr::new(TrieNodeID::Node256, 0, 0)],
             block_hashes: vec![],
+            diverged: false
         }
     }
 
@@ -743,6 +759,11 @@ impl TrieCursor {
     /// end-of-path?
     pub fn eop(&self) -> bool {
         self.index == self.path.len()
+    }
+
+    /// diverged from path?
+    pub fn div(&self) -> bool {
+        self.diverged
     }
 
     /// last ptr pushed
@@ -818,6 +839,7 @@ impl TrieCursor {
             if node_path[i] != path_bytes[self.index] {
                 // diverged
                 test_debug!("cursor: diverged({:?} != {:?}): i = {}, self.index = {}, self.node_path_index = {}", &node_path, &path_bytes, i, self.index, self.node_path_index);
+                self.diverged = true;
                 return None;
             }
             self.index += 1;
@@ -840,11 +862,13 @@ impl TrieCursor {
             let do_walk = match ptr_opt {
                 Some(ref ptr) => {
                     if !is_backptr(ptr.id()) {
-                        self.node_ptrs.push(ptr.clone());
-                        self.block_hashes.push(block_hash.clone());
+                        // already resolved
+                        self.walk_backptr_resolved(&ptr, block_hash);
                         true
                     }
                     else {
+                        // the caller will need to follow the backptr, and call
+                        // walk_backptr_resolved() with the ptr and block_hash followed.
                         false
                     }
                 },
@@ -858,7 +882,7 @@ impl TrieCursor {
             }
 
             if ptr_opt.is_none() {
-                test_debug!("cursor: not found: chr = {}, self.index = {}, self.path = {:?}", chr, self.index-1, &path_bytes);
+                test_debug!("cursor: not found: chr = {:x}, self.index = {}, self.path = {:?}", chr, self.index-1, &path_bytes);
             }
             ptr_opt
         }
@@ -866,6 +890,11 @@ impl TrieCursor {
             test_debug!("cursor: now out of path");
             None
         }
+    }
+
+    pub fn walk_backptr_resolved(&mut self, ptr: &TriePtr, block_hash: &BlockHeaderHash) -> () {
+        self.node_ptrs.push(ptr.clone());
+        self.block_hashes.push(block_hash.clone());
     }
 }
 
@@ -956,7 +985,7 @@ impl TrieNode16 {
         TrieNode16 {
             path: node4.path.clone(),
             ptrs: ptrs,
-            backptrs: vec![]
+            backptrs: node4.backptrs.clone(),
         }
     }
 }
@@ -1002,7 +1031,7 @@ impl TrieNode48 {
             path: node16.path.clone(),
             indexes: indexes,
             ptrs: ptrs,
-            backptrs: vec![]
+            backptrs: node16.backptrs.clone(),
         }
     }
 }
@@ -1044,7 +1073,7 @@ impl TrieNode256 {
         TrieNode256 {
             path: node48.path.clone(),
             ptrs: ptrs,
-            backptrs: vec![],
+            backptrs: node48.backptrs.clone(),
         }
     }
 }
@@ -1053,28 +1082,30 @@ impl TrieNode256 {
 #[derive(Clone)]
 pub struct TrieBackPtr {
     block_hash: BlockHeaderHash,
-    ptr: TriePtr
+    ptr: TriePtr,
+    hash: TrieHash
 }
 
 pub const TRIEBACKPTR_ENCODED_LEN : usize = 32 + TRIEPTR_SIZE;
 
 impl fmt::Debug for TrieBackPtr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "TrieBackPtr(block_hash={}, ptr={})", &to_hex(self.block_hash.as_bytes()), ptrs_fmt(&[self.ptr]))
+        write!(f, "TrieBackPtr(block_hash={}, ptr={}, hash={:?})", &to_hex(self.block_hash.as_bytes()), ptrs_fmt(&[self.ptr]), &self.hash)
     }
 }
 
 impl PartialEq for TrieBackPtr {
     fn eq(&self, other: &TrieBackPtr) -> bool {
-        self.block_hash == other.block_hash && self.ptr == other.ptr
+        self.block_hash == other.block_hash && self.ptr == other.ptr && self.hash == other.hash
     }
 }
 
 impl TrieBackPtr {
-    pub fn new(block_hash: &BlockHeaderHash, ptr: &TriePtr) -> TrieBackPtr {
+    pub fn new(block_hash: &BlockHeaderHash, ptr: &TriePtr, hash: &TrieHash) -> TrieBackPtr {
         TrieBackPtr {
             block_hash: block_hash.clone(),
             ptr: ptr.clone(),
+            hash: hash.clone()
         }
     }
 }
@@ -1152,6 +1183,7 @@ fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
     Ok(retbuf)
 }
 
+#[inline]
 fn check_node_id(nid: u8) -> bool {
     let node_id = clear_backptr(nid);
     node_id == TrieNodeID::Leaf ||
@@ -1162,6 +1194,7 @@ fn check_node_id(nid: u8) -> bool {
     node_id == TrieNodeID::Node256
 }
 
+#[inline]
 fn node_id_to_ptr_count(node_id: u8) -> usize {
     match clear_backptr(node_id) {
         TrieNodeID::Leaf => 0,
@@ -1174,31 +1207,43 @@ fn node_id_to_ptr_count(node_id: u8) -> usize {
     }
 }
 
+#[inline]
 fn get_ptrs_byte_len(ptrs: &[TriePtr]) -> usize {
     let node_id_len = 1;
     node_id_len + TRIEPTR_SIZE * ptrs.len()
 }
 
+#[inline]
 fn ptrs_to_bytes(node_id: u8, ptrs: &[TriePtr], buf: &mut Vec<u8>) -> () {
     assert!(check_node_id(node_id));
     assert_eq!(node_id_to_ptr_count(node_id), ptrs.len());
 
     buf.push(node_id);
-    for ptr in ptrs.iter() {
-        ptr.to_bytes(buf);
+
+    // faster than "for ptr in ptrs.iter()"
+    let mut i = 0;
+    while i < ptrs.len() {
+        ptrs[i].to_bytes(buf);
+        i += 1;
     }
 }
 
+#[inline]
 fn ptrs_to_consensus_bytes(node_id: u8, ptrs: &[TriePtr], buf: &mut Vec<u8>) -> () {
     assert!(check_node_id(node_id));
 
     buf.push(node_id);
-    for ptr in ptrs.iter() {
-        ptr.to_consensus_bytes(buf);
+    
+    // faster than "for ptr in ptrs.iter()"
+    let mut i = 0;
+    while i < ptrs.len() {
+        ptrs[i].to_consensus_bytes(buf);
+        i += 1;
     }
 }
 
-fn ptrs_from_bytes<R: Read>(node_id: u8, r: &mut R) -> Result<(u8, Vec<TriePtr>), Error> {
+#[inline]
+fn ptrs_from_bytes<R: Read>(node_id: u8, r: &mut R, ptrs_buf: &mut [TriePtr]) -> Result<u8, Error> {
     if !check_node_id(node_id) {
         test_debug!("Bad node ID {:x}", node_id);
         return Err(Error::CorruptionError(format!("Bad node ID: {:x}", node_id)));
@@ -1211,8 +1256,10 @@ fn ptrs_from_bytes<R: Read>(node_id: u8, r: &mut R) -> Result<(u8, Vec<TriePtr>)
         test_debug!("Bad l_idbuf: {}", l_idbuf);
         return Err(Error::CorruptionError("Failed to read node ID".to_string()));
     }
-    if clear_backptr(idbuf[0]) != clear_backptr(node_id) {
-        test_debug!("Bad idbuf: {:x} != {:x}", idbuf[0], node_id);
+    let nid = idbuf[0];
+
+    if clear_backptr(nid) != clear_backptr(node_id) {
+        test_debug!("Bad idbuf: {:x} != {:x}", nid, node_id);
         return Err(Error::CorruptionError("Failed to read expected node ID".to_string()));
     }
 
@@ -1225,13 +1272,13 @@ fn ptrs_from_bytes<R: Read>(node_id: u8, r: &mut R) -> Result<(u8, Vec<TriePtr>)
         return Err(Error::CorruptionError(format!("Failed to read node: got {} out of {} bytes", l_bytes, num_ptrs * TRIEPTR_SIZE)));
     }
     
-    let mut ret = Vec::with_capacity(num_ptrs);
-    for i in 0..num_ptrs {
-        let ptr_bytes = &bytes[i*TRIEPTR_SIZE..(i+1)*TRIEPTR_SIZE];
-        let ptr = TriePtr::from_bytes(ptr_bytes);
-        ret.push(ptr);
+    // not a for-loop because "for i in 0..num_ptrs" is actually kinda slow
+    let mut i = 0;
+    while i < num_ptrs {
+        ptrs_buf[i] = TriePtr::from_bytes(&bytes[i*TRIEPTR_SIZE..(i+1)*TRIEPTR_SIZE]);
+        i += 1;
     }
-    Ok((idbuf[0], ret))
+    Ok(nid)
 }
 
 #[inline]
@@ -1247,9 +1294,13 @@ fn backptrs_from_bytes<R: Read>(node_id: u8, r: &mut R) -> Result<Vec<TrieBackPt
 
     // read backptrs
     let mut backptrs = Vec::with_capacity(lenbuf[0] as usize);
-    for i in 0..(lenbuf[0] as usize) {
+    
+    // not a for-loop because "for i in 0..lenbuf[0]" is actually kinda slow
+    let mut i = 0;
+    while i < (lenbuf[0] as usize) { 
         let backptr = TrieBackPtr::from_bytes(r)?;
         backptrs.push(backptr);
+        i += 1;
     }
 
     Ok(backptrs)
@@ -1333,14 +1384,9 @@ impl TrieNode for TrieNode4 {
     }
 
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode4, Error> {
-        let (id, ptrs) = ptrs_from_bytes(TrieNodeID::Node4, r)?;
-        assert!(ptrs.len() == 4);
-
-        let path = path_from_bytes(r)?;
-
         let mut ptrs_slice = [TriePtr::default(); 4];
-        ptrs_slice.copy_from_slice(&ptrs[..]);
-
+        let id = ptrs_from_bytes(TrieNodeID::Node4, r, &mut ptrs_slice)?;
+        let path = path_from_bytes(r)?;
         let backptrs = backptrs_from_bytes(id, r)?;
 
         Ok(TrieNode4 {
@@ -1431,11 +1477,8 @@ impl TrieNode for TrieNode16 {
     }
 
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode16, Error> {
-        let (id, ptrs) = ptrs_from_bytes(TrieNodeID::Node16, r)?;
-        assert!(ptrs.len() == 16);
-
         let mut ptrs_slice = [TriePtr::default(); 16];
-        ptrs_slice.copy_from_slice(&ptrs[..]);
+        let id = ptrs_from_bytes(TrieNodeID::Node16, r, &mut ptrs_slice)?;
 
         let path = path_from_bytes(r)?;
         let backptrs = backptrs_from_bytes(id, r)?;
@@ -1530,8 +1573,8 @@ impl TrieNode for TrieNode48 {
     }
 
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode48, Error> {
-        let (id, ptrs) = ptrs_from_bytes(TrieNodeID::Node48, r)?;
-        assert!(ptrs.len() == 48);
+        let mut ptrs_slice = [TriePtr::default(); 48];
+        let id = ptrs_from_bytes(TrieNodeID::Node48, r, &mut ptrs_slice)?;
         
         let mut indexes = [0u8; 256];
         let l_indexes = r.read(&mut indexes)
@@ -1543,22 +1586,27 @@ impl TrieNode for TrieNode48 {
 
         let path = path_from_bytes(r)?;
 
-        let mut ptrs_slice = [TriePtr::default(); 48];
-        ptrs_slice.copy_from_slice(&ptrs[..]);
-
         let indexes_i8 : Vec<i8> = indexes.iter().map(|i| { let j = *i as i8; j } ).collect();
         let mut indexes_slice = [0i8; 256];
         indexes_slice.copy_from_slice(&indexes_i8[..]);
 
-        for ptr in ptrs_slice.iter() {
+        // not a for-loop because "for ptr in ptrs_slice.iter()" is actually kinda slow
+        let mut i = 0;
+        while i < ptrs_slice.len() {
+            let ptr = &ptrs_slice[i];
             if !(ptr.id() == TrieNodeID::Empty || (indexes_slice[ptr.chr() as usize] >= 0 && indexes_slice[ptr.chr() as usize] < 48)) {
                 return Err(Error::CorruptionError("Node48: corrupt index array: invalid index value".to_string()));
             }
+            i += 1;
         }
-        for i in 0..256 {
+
+        // not a for-loop because "for i in 0..256" is actually kinda slow
+        i = 0;
+        while i < 256 {
             if !(indexes_slice[i] < 0 || (indexes_slice[i] >= 0 && (indexes_slice[i] as usize) < ptrs_slice.len() && ptrs_slice[indexes_slice[i] as usize].id() != TrieNodeID::Empty)) {
                 return Err(Error::CorruptionError("Node48: corrupt index array: index points to empty node".to_string()));
             }
+            i += 1;
         }
         
         let backptrs = backptrs_from_bytes(id, r)?;
@@ -1653,14 +1701,10 @@ impl TrieNode for TrieNode256 {
     }
 
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieNode256, Error> {
-        let (id, ptrs) = ptrs_from_bytes(TrieNodeID::Node256, r)?;
-        assert!(ptrs.len() == 256);
+        let mut ptrs_slice = [TriePtr::default(); 256];
+        let id = ptrs_from_bytes(TrieNodeID::Node256, r, &mut ptrs_slice)?;
 
         let path = path_from_bytes(r)?;
-
-        let mut ptrs_slice = [TriePtr::default(); 256];
-        ptrs_slice.copy_from_slice(&ptrs[..]);
-
         let backptrs = backptrs_from_bytes(id, r)?;
 
         Ok(TrieNode256 {
@@ -1798,7 +1842,8 @@ impl TrieNode for TrieBackPtr {
     fn empty() -> TrieBackPtr {
         TrieBackPtr {
             block_hash: BlockHeaderHash([0u8; 32]),
-            ptr: TriePtr::new(0,0,0)
+            ptr: TriePtr::new(0,0,0),
+            hash: TrieHash([0u8; 32])
         }
     }
 
@@ -1809,32 +1854,43 @@ impl TrieNode for TrieBackPtr {
     fn to_bytes(&self, ret: &mut Vec<u8>) -> () {
         ptrs_to_bytes(TrieNodeID::BackPtr, &[self.ptr], ret);
         ret.extend_from_slice(self.block_hash.as_bytes());
+        ret.extend_from_slice(self.hash.as_bytes());
     }
 
     fn to_consensus_bytes(&self, buf: &mut Vec<u8>) -> () {
         ptrs_to_bytes(TrieNodeID::BackPtr, &[self.ptr], buf);   // NOTE: not ptrs_to_consensus_bytes -- need to preserve backptr depth
         buf.extend_from_slice(self.block_hash.as_bytes());
+        buf.extend_from_slice(self.hash.as_bytes());
     }
     
     fn byte_len(&self) -> usize {
-        get_ptrs_byte_len(&[self.ptr]) + self.block_hash.len()
+        get_ptrs_byte_len(&[self.ptr]) + self.block_hash.len() + TRIEHASH_ENCODED_SIZE
     }
 
     fn from_bytes<R: Read>(r: &mut R) -> Result<TrieBackPtr, Error> {
-        let (id, ptrs) = ptrs_from_bytes(TrieNodeID::BackPtr, r)?;
-        assert!(ptrs.len() == 1);
+        let mut ptrs_slice = [TriePtr::default()];
+        let id = ptrs_from_bytes(TrieNodeID::BackPtr, r, &mut ptrs_slice)?;
 
-        let mut block_hash_bytes = [0u8; 32];
+        let mut block_hash_bytes = [0u8; (BLOCK_HEADER_HASH_ENCODED_SIZE as usize)];
         let l_block_hash = r.read(&mut block_hash_bytes)
             .map_err(Error::IOError)?;
 
-        if l_block_hash != 32 {
-            return Err(Error::CorruptionError(format!("Backptr: Failed to read block hash ({} out of {} bytes)", l_block_hash, 32)));
+        if l_block_hash != (BLOCK_HEADER_HASH_ENCODED_SIZE as usize) {
+            return Err(Error::CorruptionError(format!("Backptr: Failed to read block hash ({} out of {} bytes)", l_block_hash, BLOCK_HEADER_HASH_ENCODED_SIZE)));
+        }
+
+        let mut node_hash = [0u8; (TRIEHASH_ENCODED_SIZE as usize)];
+        let l_node_hash = r.read(&mut node_hash)
+            .map_err(Error::IOError)?;
+
+        if l_node_hash != (TRIEHASH_ENCODED_SIZE as usize) {
+            return Err(Error::CorruptionError(format!("Backptr: failed to read node hash ({} out of {} bytes)", l_node_hash, TRIEHASH_ENCODED_SIZE)));
         }
 
         Ok(TrieBackPtr {
             block_hash: BlockHeaderHash(block_hash_bytes),
-            ptr: ptrs[0].clone()
+            ptr: ptrs_slice[0],
+            hash: TrieHash(node_hash)
         })
     }
 
@@ -1908,7 +1964,14 @@ fn get_node_hash_bytes<T: TrieNode + std::fmt::Debug>(node: &T, child_hash_bytes
     res.copy_from_slice(sha2.result().as_slice());
 
     let ret = TrieHash(res);
-    test_debug!("get_node_hash_bytes: hash {:?} = {:?} + {:?}", &ret, node, child_hash_bytes);
+
+    if child_hash_bytes.len() >= 50 {
+        test_debug!("get_node_hash_bytes: hash {:?} = {:?} + {:?}... ({})", &ret, node, &child_hash_bytes[0..50], child_hash_bytes.len());
+    }
+    else {
+        test_debug!("get_node_hash_bytes: hash {:?} = {:?} + {:?}... ({})", &ret, node, &child_hash_bytes, child_hash_bytes.len());
+    }
+
     ret
 }
 
@@ -1947,7 +2010,7 @@ fn read_nodetype<F: Read + Write + Seek>(f: &mut F, ptr: &TriePtr) -> Result<(Tr
     let mut h_bytes = Vec::with_capacity(TRIEHASH_ENCODED_SIZE);
     read_node_hash_bytes(f, ptr, &mut h_bytes)?;
 
-    let node = match clear_backptr(ptr.id()) {
+    let node = match ptr.id() {
         TrieNodeID::Node4 => {
             let node = TrieNode4::from_bytes(f)?;
             TrieNodeType::Node4(node)
@@ -2022,9 +2085,10 @@ pub trait TrieStorage {
     fn extend(&mut self, bhh: &BlockHeaderHash) -> Result<(), Error>;
     fn open(&mut self, bhh: &BlockHeaderHash, readwrite: bool) -> Result<(), Error>;
     fn tell(&self) -> BlockHeaderHash;
+    fn readwrite(&self) -> bool;
     fn format(&mut self) -> Result<(), Error>;
     fn format_block(&mut self, &BlockHeaderHash) -> Result<(), Error>;
-    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, buf: &mut Vec<u8>, is_backptr: bool) -> Result<(), Error>;
+    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, buf: &mut Vec<u8>) -> Result<(), Error>;
     fn read_node(&mut self, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash), Error>;
     fn write_node(&mut self, node: &TrieNodeType, hash: TrieHash) -> Result<(), Error>;
     fn flush(&mut self) -> Result<(), Error>;
@@ -2139,7 +2203,7 @@ impl TrieRAM {
                 TrieNodeType::BackPtr(_) => {},
                 TrieNodeType::Node4(ref data) => {
                     for i in 0..4 {
-                        if data.ptrs[i].id != TrieNodeID::Empty {
+                        if data.ptrs[i].id != TrieNodeID::Empty && !is_backptr(data.ptrs[i].id) {
                             let (child, child_hash) = self.read_node(&data.ptrs[i])?;
                             frontier.push_back((child, child_hash));
                         }
@@ -2147,7 +2211,7 @@ impl TrieRAM {
                 },
                 TrieNodeType::Node16(ref data) => {
                     for i in 0..16 {
-                        if data.ptrs[i].id != TrieNodeID::Empty {
+                        if data.ptrs[i].id != TrieNodeID::Empty && !is_backptr(data.ptrs[i].id) {
                             let (child, child_hash) = self.read_node(&data.ptrs[i])?;
                             frontier.push_back((child, child_hash));
                         }
@@ -2155,7 +2219,7 @@ impl TrieRAM {
                 },
                 TrieNodeType::Node48(ref data) => {
                     for i in 0..48 {
-                        if data.ptrs[i].id != TrieNodeID::Empty {
+                        if data.ptrs[i].id != TrieNodeID::Empty && !is_backptr(data.ptrs[i].id) {
                             let (child, child_hash) = self.read_node(&data.ptrs[i])?;
                             frontier.push_back((child, child_hash));
                         }
@@ -2163,7 +2227,7 @@ impl TrieRAM {
                 },
                 TrieNodeType::Node256(ref data) => {
                     for i in 0..256 {
-                        if data.ptrs[i].id != TrieNodeID::Empty {
+                        if data.ptrs[i].id != TrieNodeID::Empty && !is_backptr(data.ptrs[i].id) {
                             let (child, child_hash) = self.read_node(&data.ptrs[i])?;
                             frontier.push_back((child, child_hash));
                         }
@@ -2185,7 +2249,7 @@ impl TrieRAM {
                 TrieNodeType::BackPtr(_) => {},
                 TrieNodeType::Node4(ref mut data) => {
                     for k in 0..4 {
-                        if data.ptrs[k].id != TrieNodeID::Empty {
+                        if data.ptrs[k].id != TrieNodeID::Empty && !is_backptr(data.ptrs[k].id) {
                             data.ptrs[k].ptr = offsets[i];
                             i += 1;
                         }
@@ -2193,7 +2257,7 @@ impl TrieRAM {
                 },
                 TrieNodeType::Node16(ref mut data) => {
                     for k in 0..16 {
-                        if data.ptrs[k].id != TrieNodeID::Empty {
+                        if data.ptrs[k].id != TrieNodeID::Empty && !is_backptr(data.ptrs[k].id) {
                             data.ptrs[k].ptr = offsets[i];
                             i += 1;
                         }
@@ -2201,7 +2265,7 @@ impl TrieRAM {
                 },
                 TrieNodeType::Node48(ref mut data) => {
                     for k in 0..48 {
-                        if data.ptrs[k].id != TrieNodeID::Empty {
+                        if data.ptrs[k].id != TrieNodeID::Empty && !is_backptr(data.ptrs[k].id) {
                             data.ptrs[k].ptr = offsets[i];
                             i += 1;
                         }
@@ -2209,7 +2273,7 @@ impl TrieRAM {
                 },
                 TrieNodeType::Node256(ref mut data) => {
                     for k in 0..256 {
-                        if data.ptrs[k].id != TrieNodeID::Empty {
+                        if data.ptrs[k].id != TrieNodeID::Empty && !is_backptr(data.ptrs[k].id) {
                             data.ptrs[k].ptr = offsets[i];
                             i += 1;
                         }
@@ -2285,8 +2349,13 @@ impl TrieStorage for TrieRAM {
         self.block_header.clone()
     }
 
+    fn readwrite(&self) -> bool {
+        !self.readonly
+    }
+
     fn format(&mut self) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2298,6 +2367,7 @@ impl TrieStorage for TrieRAM {
 
     fn format_block(&mut self, bhh: &BlockHeaderHash) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2313,7 +2383,7 @@ impl TrieStorage for TrieRAM {
         }
     }
 
-    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, buf: &mut Vec<u8>, is_backptr: bool) -> Result<(), Error> {
+    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, buf: &mut Vec<u8>) -> Result<(), Error> {
         if ptr.ptr() >= (self.data.len() as u64) {
             Err(Error::NotFoundError)
         }
@@ -2328,11 +2398,11 @@ impl TrieStorage for TrieRAM {
         test_debug!("read_node({:?}): at {}: {:?}", &self.block_header, disk_ptr, ptr);
 
         self.read_count += 1;
-        if ptr.id() == TrieNodeID::Leaf {
-            self.read_leaf_count += 1;
-        }
-        else if ptr.id() == TrieNodeID::BackPtr {
+        if is_backptr(ptr.id()) {
             self.read_backptr_count += 1;
+        }
+        else if ptr.id() == TrieNodeID::Leaf {
+            self.read_leaf_count += 1;
         }
         else {
             self.read_node_count += 1;
@@ -2348,6 +2418,7 @@ impl TrieStorage for TrieRAM {
 
     fn write_node(&mut self, node: &TrieNodeType, hash: TrieHash) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2356,15 +2427,27 @@ impl TrieStorage for TrieRAM {
         
         self.write_count += 1;
         match node {
-            TrieNodeType::Leaf(_) => {
+            TrieNodeType::Leaf(ref data) => {
                 self.write_leaf_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
             },
-            TrieNodeType::BackPtr(_) => {
-                self.write_backptr_count += 1;
-            },
-            _ => {
+            TrieNodeType::Node4(ref data) => {
                 self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
             }
+            TrieNodeType::Node16(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            TrieNodeType::Node48(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            TrieNodeType::Node256(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            _ => {}
         }
 
         if self.offset < (self.data.len() as u64) {
@@ -2538,9 +2621,14 @@ impl TrieStorage for TrieIOBuffer {
     fn tell(&self) -> BlockHeaderHash {
         self.block_header.clone()
     }
+    
+    fn readwrite(&self) -> bool {
+        !self.readonly
+    }
 
     fn format(&mut self) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2550,6 +2638,7 @@ impl TrieStorage for TrieIOBuffer {
 
     fn format_block(&mut self, bhh: &BlockHeaderHash) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
         self.bufs.insert((*bhh).clone(), Cursor::new(vec![]));
@@ -2557,7 +2646,7 @@ impl TrieStorage for TrieIOBuffer {
         Ok(())
     }
 
-    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, hash_buf: &mut Vec<u8>, is_backptr: bool) -> Result<(), Error> {
+    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, hash_buf: &mut Vec<u8>) -> Result<(), Error> {
         match self.bufs.get_mut(&self.block_header) {
             Some(ref mut buf) => {
                 read_node_hash_bytes(buf, ptr, hash_buf)
@@ -2573,22 +2662,24 @@ impl TrieStorage for TrieIOBuffer {
         test_debug!("read_node({:?}): {:?}", &self.block_header, ptr);
         
         self.read_count += 1;
-        if ptr.id() == TrieNodeID::Leaf {
-            self.read_leaf_count += 1;
-        }
-        else if ptr.id() == TrieNodeID::BackPtr {
+        if is_backptr(ptr.id()) {
             self.read_backptr_count += 1;
+        }
+        else if ptr.id() == TrieNodeID::Leaf {
+            self.read_leaf_count += 1;
         }
         else {
             self.read_node_count += 1;
         }
 
+        let clear_ptr = TriePtr::new(clear_backptr(ptr.id()), ptr.chr(), ptr.ptr());
+
         match self.bufs.get_mut(&self.block_header) {
             Some(ref mut buf) => {
-                read_nodetype(buf, ptr)
+                read_nodetype(buf, &clear_ptr)
             },
             None => {
-                test_debug!("Node not found: {:?}", ptr);
+                test_debug!("Node not found: {:?}", &clear_ptr);
                 Err(Error::NotFoundError)
             }
         }
@@ -2596,6 +2687,7 @@ impl TrieStorage for TrieIOBuffer {
     
     fn write_node(&mut self, node: &TrieNodeType, hash: TrieHash) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2604,15 +2696,27 @@ impl TrieStorage for TrieIOBuffer {
         
         self.write_count += 1;
         match node {
-            TrieNodeType::Leaf(_) => {
+            TrieNodeType::Leaf(ref data) => {
                 self.write_leaf_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
             },
-            TrieNodeType::BackPtr(_) => {
-                self.write_backptr_count += 1;
-            },
-            _ => {
+            TrieNodeType::Node4(ref data) => {
                 self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
             }
+            TrieNodeType::Node16(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            TrieNodeType::Node48(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            TrieNodeType::Node256(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            },
+            _ => {}
         }
 
         match self.bufs.get_mut(&self.block_header) {
@@ -2751,9 +2855,9 @@ impl TrieFileStorage {
     }
 
     fn block_dir(&self, bhh: &BlockHeaderHash) -> PathBuf {
-        let bhh_hex = bhh.to_hex();
-        let bhh_1 = bhh_hex.as_str()[0..2].to_string();
-        let bhh_2 = bhh_hex.as_str()[2..4].to_string();
+        let bhh_bytes = bhh.as_bytes();
+        let bhh_1 = format!("{:02x}", bhh_bytes[0]);
+        let bhh_2 = format!("{:02x}", bhh_bytes[1]);
         let p = Path::new(&self.dir_path)
                     .join(bhh_1)
                     .join(bhh_2);
@@ -2761,7 +2865,19 @@ impl TrieFileStorage {
     }
 
     fn block_path(&self, bhh: &BlockHeaderHash) -> PathBuf {
-        self.block_dir(bhh).join(bhh.to_hex())
+        // waaaay faster than to_hex()
+        let bhh_bytes = bhh.as_bytes();
+        let bhh_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                              bhh_bytes[0],     bhh_bytes[1],       bhh_bytes[2],       bhh_bytes[3],
+                              bhh_bytes[4],     bhh_bytes[5],       bhh_bytes[6],       bhh_bytes[7],
+                              bhh_bytes[8],     bhh_bytes[9],       bhh_bytes[10],      bhh_bytes[11],
+                              bhh_bytes[12],    bhh_bytes[13],      bhh_bytes[14],      bhh_bytes[15],
+                              bhh_bytes[16],    bhh_bytes[17],      bhh_bytes[18],      bhh_bytes[19],
+                              bhh_bytes[20],    bhh_bytes[21],      bhh_bytes[22],      bhh_bytes[23],
+                              bhh_bytes[24],    bhh_bytes[25],      bhh_bytes[26],      bhh_bytes[27],
+                              bhh_bytes[28],    bhh_bytes[29],      bhh_bytes[30],      bhh_bytes[31]);
+
+        self.block_dir(bhh).join(bhh_hex)
     }
 }
 
@@ -2851,9 +2967,14 @@ impl TrieStorage for TrieFileStorage {
     fn tell(&self) -> BlockHeaderHash {
         self.cur_block.clone()
     }
+    
+    fn readwrite(&self) -> bool {
+        !self.readonly
+    }
 
     fn format(&mut self) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2879,6 +3000,7 @@ impl TrieStorage for TrieFileStorage {
 
     fn format_block(&mut self, bhh: &BlockHeaderHash) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2909,13 +3031,12 @@ impl TrieStorage for TrieFileStorage {
         Ok(())
     }
 
-    // TODO: if is_backptr is true, it's safe to cache the resulting hash in RAM.  Do so.
-    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, buf: &mut Vec<u8>, is_backptr: bool) -> Result<(), Error> {
+    fn read_node_hash_bytes(&mut self, ptr: &TriePtr, buf: &mut Vec<u8>) -> Result<(), Error> {
         if Some(self.cur_block) == self.last_extended {
             // special case 
             assert!(self.last_extended_trie.is_some());
             return match self.last_extended_trie {
-                Some(ref mut trie_storage) => trie_storage.read_node_hash_bytes(ptr, buf, is_backptr),
+                Some(ref mut trie_storage) => trie_storage.read_node_hash_bytes(ptr, buf),
                 None => unreachable!()
             };
         }
@@ -2931,34 +3052,37 @@ impl TrieStorage for TrieFileStorage {
         test_debug!("read_node({:?}): {:?}", &self.cur_block, ptr);
 
         self.read_count += 1;
-        if ptr.id() == TrieNodeID::Leaf {
-            self.read_leaf_count += 1;
-        }
-        else if ptr.id() == TrieNodeID::BackPtr {
+        if is_backptr(ptr.id()) {
             self.read_backptr_count += 1;
+        }
+        else if ptr.id() == TrieNodeID::Leaf {
+            self.read_leaf_count += 1;
         }
         else {
             self.read_node_count += 1;
         }
+        
+        let clear_ptr = TriePtr::new(clear_backptr(ptr.id()), ptr.chr(), ptr.ptr());
 
         if Some(self.cur_block) == self.last_extended {
             // special case
             assert!(self.last_extended_trie.is_some());
             return match self.last_extended_trie {
-                Some(ref mut trie_storage) => trie_storage.read_node(ptr),
+                Some(ref mut trie_storage) => trie_storage.read_node(&clear_ptr),
                 None => unreachable!()
             };
         }
 
         // some other block
         match self.cur_block_fd {
-            Some(ref mut f) => read_nodetype(f, ptr),
+            Some(ref mut f) => read_nodetype(f, &clear_ptr),
             None => Err(Error::NotFoundError)
         }
     }
     
     fn write_node(&mut self, node: &TrieNodeType, hash: TrieHash) -> Result<(), Error> {
         if self.readonly {
+            test_debug!("Read-only!");
             return Err(Error::ReadOnlyError);
         }
 
@@ -2967,15 +3091,27 @@ impl TrieStorage for TrieFileStorage {
         
         self.write_count += 1;
         match node {
-            TrieNodeType::Leaf(_) => {
+            TrieNodeType::Leaf(ref data) => {
                 self.write_leaf_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
             },
-            TrieNodeType::BackPtr(_) => {
-                self.write_backptr_count += 1;
-            },
-            _ => {
+            TrieNodeType::Node4(ref data) => {
                 self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
             }
+            TrieNodeType::Node16(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            TrieNodeType::Node48(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            TrieNodeType::Node256(ref data) => {
+                self.write_node_count += 1;
+                self.write_backptr_count += data.backptrs.len() as u64;
+            }
+            _ => {}
         }
 
         if Some(self.cur_block) == self.last_extended {
@@ -3135,105 +3271,121 @@ where
         }
     }
  
-    /// Given a node's backptrs and a ptr of interest, walk the backptrs back and read the node that
-    /// the ptr points to.  Also return (non-backptr) ptr we used.
+    /// Given a node's backptrs and a child ptr of interest, walk the backptrs back and read the child node that
+    /// the ptr points to.
     /// s will point to the last block header visited.  On Ok, this is the block header of the
     /// target node.
-    fn resolve_backptrs(s: &mut S, backptrs: &Vec<TrieBackPtr>, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
-        let mut cur_ptr = ptr.clone();
+    fn walk_backptrs(s: &mut S, backptrs: &Vec<TrieBackPtr>, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
+        test_debug!("Walk backptrs to {:?}: {:?}", backptrs, ptr);
+        if !is_backptr(ptr.id()) {
+            // child is in this block 
+            if ptr.id() == TrieNodeID::Empty {
+                // shouldn't happen 
+                return Err(Error::CorruptionError("ptr is empty".to_string()));
+            }
+            let (node, node_hash) = s.read_node(&ptr)?;
+            return Ok((node, node_hash, ptr.clone()));
+        }
+
+        // ptr is a backptr.
+        let mut depth = ptr.ptr();
+        if depth == 0 {
+            // corrupt
+            return Err(Error::CorruptionError("Invalid backptr ptr: can't be 0".to_string()));
+        }
+
+        // skip back
         let mut cur_backptrs = backptrs.clone();
-        let mut cur_node = None;
-        let mut cur_node_hash = None;
-        loop {
-            if !is_backptr(cur_ptr.id()) {
-                // child is in this block 
-                if cur_ptr.id() == TrieNodeID::Empty {
-                    // shouldn't happen
-                    panic!("Walked to an empty ptr");
+
+        while depth > 0 {
+            let bi = log2_floor(depth) as usize;
+            test_debug!("depth = {}, cur_backptrs = {:?}", depth, &cur_backptrs);
+            test_debug!("skip to {} in {:?}", bi, &cur_backptrs);
+
+            if bi >= cur_backptrs.len() {
+                // corrupt
+                return Err(Error::CorruptionError(format!("Invalid backptr ptr: index {} is out of range of {}", bi, cur_backptrs.len())));
+            }
+
+            // read the node at this backptr
+            let backptr = cur_backptrs[bi].clone();
+            s.open(&backptr.block_hash, false)?;
+
+            // as a hint, set the backptr bit on this node's ID
+            let backptr_ptr = TriePtr::new(set_backptr(backptr.ptr.id()), backptr.ptr.chr(), backptr.ptr.ptr());
+            let (next_node, next_hash) = s.read_node(&backptr_ptr)?;
+
+            // next backptrs
+            let (next_backptrs, next_ptr_opt) = match next_node {
+                TrieNodeType::Node4(ref data) => {
+                    (data.backptrs.clone(), data.walk(ptr.chr()))
+                },
+                TrieNodeType::Node16(ref data) => {
+                    (data.backptrs.clone(), data.walk(ptr.chr()))
+                },
+                TrieNodeType::Node48(ref data) => {
+                    (data.backptrs.clone(), data.walk(ptr.chr()))
+                },
+                TrieNodeType::Node256(ref data) => {
+                    (data.backptrs.clone(), data.walk(ptr.chr()))
+                },
+                _ => {
+                    return Err(Error::CorruptionError(format!("Walked to non-intermediate node from {:?}", &backptr.ptr)));
                 }
-                else {
-                    // found!
-                    let (ret_node, ret_node_hash) = match (cur_node, cur_node_hash) {
-                        (Some(node), Some(node_hash)) => {
-                            (node, node_hash)
-                        },
-                        (_, _) => {
-                            let (node, node_hash) = s.read_node(&cur_ptr)?;
-                            (node, node_hash)
-                        }
-                    };
-                                
-                    return Ok((ret_node, ret_node_hash, cur_ptr));
+            };
+
+            let next_ptr = match next_ptr_opt {
+                None => {
+                    return Err(Error::CorruptionError(format!("No ptr found in {:?}", &next_node)));
+                },
+                Some(ptr) => {
+                    ptr
                 }
+            };
+
+            if !is_backptr(next_ptr.id()) {
+                // found!
+                let (node, node_hash) = s.read_node(&next_ptr)?;
+                return Ok((node, node_hash, next_ptr));
             }
             else {
-                // backptr. walk back.
-                let depth = cur_ptr.ptr() as usize;
-                if depth == 0 {
-                    // corrupt
-                    return Err(Error::CorruptionError("Invalid backptr ptr: can't be 0".to_string()));
+                // not in this node.
+                // sanity check
+                if next_ptr.chr() != ptr.chr() {
+                    return Err(Error::CorruptionError(format!("Next ptr is {:?} but we were given {:?}", &next_ptr, ptr)));
                 }
 
-                let bi = log2_floor(depth as u64) as usize;
-                if bi >= backptrs.len() {
-                    // corrupt node 
-                    return Err(Error::CorruptionError(format!("Invalid backptr ptr: index {} is out of range of {}", bi, backptrs.len())));
-                }
-
-                // read the node at this backptr
-                let backptr = cur_backptrs[bi].clone();
-                s.open(&backptr.block_hash, false)?;
-                let (next_node, next_hash) = s.read_node(&backptr.ptr)?;
-
-                // walk to the next set of backptrs 
-                cur_ptr = backptr.ptr.clone();
-                cur_backptrs = match next_node {
-                    TrieNodeType::Leaf(ref data) => data.backptrs.clone(),
-                    TrieNodeType::Node4(ref data) => data.backptrs.clone(),
-                    TrieNodeType::Node16(ref data) => data.backptrs.clone(),
-                    TrieNodeType::Node48(ref data) => data.backptrs.clone(),
-                    TrieNodeType::Node256(ref data) => data.backptrs.clone(),
-                    TrieNodeType::BackPtr(_) => {
-                        return Err(Error::CorruptionError(format!("Walked to TrieBackPtr from {:?}", &backptr.ptr)));
-                    }
-                };
-
-                cur_node = Some(next_node);
-                cur_node_hash = Some(next_hash);
+                depth = next_ptr.ptr();
+                cur_backptrs = next_backptrs;
             }
         }
+        unreachable!();
     }
-    
-    /// Read a node's hash from its backptr
-    /// S should point to the start node's block.
-    /// S will point to the last-opened block when this method returns (on Ok or Err) -- this may
-    /// not be the same block in which this node resides.
-    fn read_node_hash_bytes_backptr(s: &mut S, backptrs: &Vec<TrieBackPtr>, ptr: &TriePtr, buf: &mut Vec<u8>) -> Result<(), Error> {
-        let (target_node, target_node_hash, target_ptr) = Trie::resolve_backptrs(s, backptrs, ptr)?;
-        buf.extend_from_slice(target_node_hash.as_bytes());
-        Ok(())
-    }
-
+  
     /// Read a sequence of hashes given a node's ptrs.
     /// If a ptr is a backptr, go and resolve the hash by walking back.
     /// On err, S may point to a prior block.  The caller should call s.open(...) if an error
     /// occurs.
-    fn read_node_hashes_bytes(s: &mut S, ptrs: &[TriePtr], backptrs: &Vec<TrieBackPtr>, buf: &mut Vec<u8>) -> Result<(), Error> {
-        let cur_block_hash = s.tell();
-        for ptr in ptrs.iter() {
+    fn read_child_hashes_bytes(s: &mut S, ptrs: &[TriePtr], backptrs: &Vec<TrieBackPtr>, buf: &mut Vec<u8>) -> Result<(), Error> {
+        // "for ptr in ptrs.iter()" is actually kinda slow, so do this instead
+        let mut i = 0;
+        while i < ptrs.len() {
+            let ptr = &ptrs[i];
             if ptr.id() == TrieNodeID::Empty {
                 // hash of empty string
                 buf.extend_from_slice(TrieHash::from_data(&[]).as_bytes());
             }
             else if !is_backptr(ptr.id()) {
                 // hash is in the same block as this node
-                s.read_node_hash_bytes(ptr, buf, false)?;
+                s.read_node_hash_bytes(ptr, buf)?;
             }
             else {
-                // hash is in a prior block. walk back and get it
-                Trie::read_node_hash_bytes_backptr(s, backptrs, ptr, buf)?;
-                s.open(&cur_block_hash, false)?;
+                // set hash to be the hash of the first prior node we'd step to
+                let backptr_idx = log2_floor(ptr.ptr());
+                assert!(backptr_idx < (backptrs.len() as u64));
+                buf.extend_from_slice(backptrs[backptr_idx as usize].hash.as_bytes());
             }
+            i += 1;
         }
         assert_eq!(buf.len() % TRIEHASH_ENCODED_SIZE, 0);
         Ok(())
@@ -3244,6 +3396,7 @@ where
     /// A BackPtr cannot be handled since the node it refers to is in another Trie.
     /// On Err, s may point to a different block hash
     fn get_children_hashes_bytes(s: &mut S, node: &TrieNodeType, buf: &mut Vec<u8>) -> Result<(), Error> {
+        test_debug!("get_children_hashes_bytes for {:?}", node);
         let cur_block_hash = s.tell();
         match node {
             TrieNodeType::BackPtr(_) => {
@@ -3253,19 +3406,19 @@ where
                 Ok(())
             },
             TrieNodeType::Node4(ref data) => {
-                Trie::read_node_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
+                Trie::read_child_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
                 Ok(())
             },
             TrieNodeType::Node16(ref data) => {
-                Trie::read_node_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
+                Trie::read_child_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
                 Ok(())
             },
             TrieNodeType::Node48(ref data) => {
-                Trie::read_node_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
+                Trie::read_child_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
                 Ok(())
             },
             TrieNodeType::Node256(ref data) => {
-                Trie::read_node_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
+                Trie::read_child_hashes_bytes(s, &data.ptrs, &data.backptrs, buf)?;
                 Ok(())
             }
         }
@@ -3300,10 +3453,24 @@ where
 
     /// Given a leaf, replace it.
     /// c must point to the value to replace
-    fn replace_leaf(s: &mut S, c: &TrieCursor, value: &TrieLeaf) -> Result<TriePtr, Error> {
+    fn replace_leaf(s: &mut S, c: &TrieCursor, value: &mut TrieLeaf) -> Result<TriePtr, Error> {
+        fseek(s, c.ptr().ptr())?;
+        
+        let (cur_leaf, _) = Trie::read_node(s, &c.ptr())?;
+        match cur_leaf {
+            TrieNodeType::Leaf(ref data) => {
+                value.path = data.path.clone();
+            },
+            _ => {
+                return Err(Error::CorruptionError(format!("Not a leaf: {:?}", &c.ptr())));
+            }
+        }
+
         let leaf_hash = get_node_hash(value, &vec![]);
         fseek(s, c.ptr().ptr())?;
         Trie::write_node(s, value, leaf_hash.clone())?;
+
+        test_debug!("replace_leaf: wrote {:?} at {:?}", value, &c.ptr());
         Ok(c.ptr())
     }
 
@@ -3449,7 +3616,7 @@ where
             assert!(inserted);
 
             let mut node_hashes_bytes = Vec::with_capacity(node_data.ptrs().len() * TRIEHASH_ENCODED_SIZE);
-            Trie::read_node_hashes_bytes(s, node_data.ptrs(), node_data.backptrs(), &mut node_hashes_bytes)?;
+            Trie::read_child_hashes_bytes(s, node_data.ptrs(), node_data.backptrs(), &mut node_hashes_bytes)?;
             let new_node_hash = get_node_hash_bytes(node_data, &node_hashes_bytes);
 
             fseek(s, c.ptr().ptr())?;
@@ -3488,7 +3655,7 @@ where
             assert!(inserted);
         
             let mut node_hashes_bytes = Vec::with_capacity(new_node_data.ptrs().len() * TRIEHASH_ENCODED_SIZE);
-            Trie::read_node_hashes_bytes(s, new_node_data.ptrs(), new_node_data.backptrs(), &mut node_hashes_bytes)?;
+            Trie::read_child_hashes_bytes(s, new_node_data.ptrs(), new_node_data.backptrs(), &mut node_hashes_bytes)?;
             let new_node_hash = get_node_hash_bytes(new_node_data, &node_hashes_bytes);
 
             let new_node_disk_ptr = fseek_end(s)?;
@@ -3699,6 +3866,7 @@ where
             // or we're somewhere in the path of a leaf.
             // Either tack the leaf on (possibly promoting the node), or splice the leaf in.
             if c.eonp(&node) {
+                test_debug!("eop = {}, eonp = {}, c = {:?}, node = {:?}", c.eop(), c.eonp(&node), c, &node);
                 Trie::insert_leaf(s, c, value, &mut node)
             }
             else {
@@ -3802,8 +3970,7 @@ where
     S: TrieStorage + Seek
 {
 
-    /// Follow a node's backptrs back to the node with the desired step to take, and take that step
-    /// to get the child at character c (if it exists)
+    // helper method for walking a node's backprs
     fn walk_backptrs(s: &mut S, start_node: &TrieNodeType, c: u8) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
         let ptr_opt = match start_node {
             TrieNodeType::Node4(ref data) => data.walk(c),
@@ -3816,23 +3983,25 @@ where
         };
         match ptr_opt {
             None => {
+                // this node never had a child for this chr
                 test_debug!("Failed to walk to '{}' from {:?}", c, start_node);
-                return Err(Error::BackptrNotFoundError);
+                Err(Error::BackptrNotFoundError)
             },
             Some(ptr) => {
+                test_debug!("Walk backptrs for {:?} to {:?} from {:?}", c, &ptr, &start_node);
+                
+                // this node had a child for this chr at one point
                 let (node, node_hash, node_ptr) = match start_node {
-                    TrieNodeType::Leaf(ref data) => Trie::resolve_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node4(ref data) => Trie::resolve_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node16(ref data) => Trie::resolve_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node48(ref data) => Trie::resolve_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node256(ref data) => Trie::resolve_backptrs(s, data.backptrs(), &ptr)?,
+                    TrieNodeType::Node4(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
+                    TrieNodeType::Node16(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
+                    TrieNodeType::Node48(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
+                    TrieNodeType::Node256(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
                     _ => {
-                        return Err(Error::CorruptionError(format!("Resolved backptr {:?} to a TrieBackPtr", &ptr)));
+                        unreachable!();
                     }
                 };
 
-                test_debug!("Walked backptrs to {:?} from {:?} to {:?}", s.tell(), start_node, &node);
-                return Ok((node, node_hash, node_ptr));
+                Ok((node, node_hash, node_ptr))
             }
         }
     }
@@ -3840,29 +4009,23 @@ where
     /// Get the backptrs for a new node, given its immediate predecessor.
     /// s must be opened to prev_node's block header hash
     /// On err, s may not point to the prev_node's block header hash (on Ok, it will)
-    fn get_new_backptrs(s: &mut S, prev_node: &TrieNodeType, prev_node_ptr: &TriePtr) -> Result<Vec<TrieBackPtr>, Error> {
+    fn get_new_backptrs(s: &mut S, prev_node: &TrieNodeType, prev_node_ptr: &TriePtr, prev_node_hash: &TrieHash) -> Result<Vec<TrieBackPtr>, Error> {
         let cur_block_hash = s.tell();
         let prev_backptrs_len = match prev_node {
             TrieNodeType::Node4(ref data) => data.backptrs().len(),
             TrieNodeType::Node16(ref data) => data.backptrs().len(),
             TrieNodeType::Node48(ref data) => data.backptrs().len(),
             TrieNodeType::Node256(ref data) => data.backptrs().len(),
-            _ => panic!("prev_node must be an intermediate node")
+            TrieNodeType::Leaf(ref data) => data.backptrs.len(),
+            _ => panic!("prev_node itself cannot be a backptr node")
         };
 
         let mut cur_node_backptrs = Vec::with_capacity(prev_backptrs_len + 1);
 
         // first backptr is to prev_node
-        let prev_node_id = 
-            if prev_backptrs_len > 0 {
-                set_backptr(prev_node_ptr.id())
-            }
-            else {
-                prev_node_ptr.id()
-            };
-
+        let prev_node_id = prev_node_ptr.id();
         let prev_node_backptr = TriePtr::new(prev_node_id, prev_node_ptr.chr(), prev_node_ptr.ptr());
-        cur_node_backptrs.push(TrieBackPtr::new(&s.tell(), &prev_node_backptr));
+        cur_node_backptrs.push(TrieBackPtr::new(&s.tell(), &prev_node_backptr, prev_node_hash));
 
         // keep skipping back until we can't find a node or find the first version of ourselves
         let mut bi = 0;
@@ -3873,6 +4036,7 @@ where
                 TrieNodeType::Node16(ref data) => data.backptrs().clone(),
                 TrieNodeType::Node48(ref data) => data.backptrs().clone(),
                 TrieNodeType::Node256(ref data) => data.backptrs().clone(),
+                TrieNodeType::Leaf(ref data) => data.backptrs().clone(),
                 _ => {
                     return Err(Error::CorruptionError("node must be intermediate".to_string()));
                 }
@@ -3905,7 +4069,7 @@ where
                 if ptrs[i].id() == TrieNodeID::Empty {
                     continue;
                 }
-                if is_backptr(ptrs[i].id()) {
+                else if is_backptr(ptrs[i].id()) {
                     // increase depth
                     ptrs[i].ptr += 1;
                 }
@@ -3921,31 +4085,26 @@ where
             TrieNodeType::Node4(ref mut data) => {
                 node_copy_update_ptrs(&mut data.ptrs);
                 data.backptrs = new_backptrs;
-                let mut hash_buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE * node_id_to_ptr_count(data.id()));
-                get_node_hash_bytes(data, &hash_buf)
+                TrieHash::from_data(&[])
             },
             TrieNodeType::Node16(ref mut data) => {
                 node_copy_update_ptrs(&mut data.ptrs);
                 data.backptrs = new_backptrs;
-                let mut hash_buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE * node_id_to_ptr_count(data.id()));
-                get_node_hash_bytes(data, &hash_buf)
+                TrieHash::from_data(&[])
             },
             TrieNodeType::Node48(ref mut data) => {
                 node_copy_update_ptrs(&mut data.ptrs);
                 data.backptrs = new_backptrs;
-                let mut hash_buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE * node_id_to_ptr_count(data.id()));
-                get_node_hash_bytes(data, &hash_buf)
+                TrieHash::from_data(&[])
             },
             TrieNodeType::Node256(ref mut data) => {
                 node_copy_update_ptrs(&mut data.ptrs);
                 data.backptrs = new_backptrs;
-                let mut hash_buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE * node_id_to_ptr_count(data.id()));
-                get_node_hash_bytes(data, &hash_buf)
+                TrieHash::from_data(&[])
             },
             TrieNodeType::Leaf(ref mut data) => {
                 data.backptrs = new_backptrs;
-                let mut hash_buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE * node_id_to_ptr_count(data.id()));
-                get_node_hash_bytes(data, &hash_buf)
+                get_node_hash_bytes(data, &vec![])
             },
             TrieNodeType::BackPtr(_) => {
                 return Err(Error::CorruptionError("Tried to node_copy_update on a BackPtr".to_string()));
@@ -3957,23 +4116,28 @@ where
     /// Given a node, and the chr of one of its children, go find the last instance of that child in
     /// the MARF and copy it forward.  Update its ptrs to point to its descendents.
     /// s must point to the block hash in which this node lives, to which the child will be copied.
-    fn node_child_copy(s: &mut S, node: &TrieNodeType, chr: u8) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
+    fn node_child_copy(s: &mut S, node: &TrieNodeType, chr: u8) -> Result<(TrieNodeType, TrieHash, TriePtr, BlockHeaderHash), Error> {
+        test_debug!("Copy to {:?} child {:x} of {:?}", s.tell(), chr, node);
+
         let cur_block_hash = s.tell();
         let (mut child_node, child_hash, child_ptr) = MARF::walk_backptrs(s, node, chr)?;
+        let child_block_hash = s.tell();
         
         // s now points to the child's block hash.  Get its new backptrs
-        let new_child_backptrs = MARF::get_new_backptrs(s, &child_node, &child_ptr)?;
+        let new_child_backptrs = MARF::get_new_backptrs(s, &child_node, &child_ptr, &child_hash)?;
 
         // update child_node with new backptrs and hashes
         s.open(&cur_block_hash, true)?;
         let child_hash = MARF::node_copy_update(s, &mut child_node, new_child_backptrs)?;
 
         // store it in this trie
-        let copy_disk_ptr = fseek_end(s)?;
-        let copy_ptr = TriePtr::new(child_ptr.id(), chr, copy_disk_ptr);
+        s.open(&cur_block_hash, true)?;
+        let child_disk_ptr = fseek_end(s)?;
+        let child_ptr = TriePtr::new(child_ptr.id(), chr, child_disk_ptr);
         s.write_node(&child_node, child_hash.clone())?;
 
-        Ok((child_node, child_hash, copy_ptr))
+        test_debug!("Copied child {:x} to {:?}: ptr={:?} child={:?}", chr, &cur_block_hash, &child_ptr, &child_node);
+        Ok((child_node, child_hash, child_ptr, child_block_hash))
     }
 
     /// Copy the root node from the previous Trie to this Trie, updating its backptrs.
@@ -3982,8 +4146,8 @@ where
         let cur_block_hash = s.tell();
         s.open(prev_block_hash, false)?;
         
-        let (mut prev_root, _) = Trie::read_root(s)?;
-        let new_root_backptrs = MARF::get_new_backptrs(s, &prev_root, &TriePtr::new(TrieNodeID::Node256, 0, 0))?;
+        let (mut prev_root, prev_root_hash) = Trie::read_root(s)?;
+        let new_root_backptrs = MARF::get_new_backptrs(s, &prev_root, &TriePtr::new(TrieNodeID::Node256, 0, 0), &prev_root_hash)?;
         let new_root_hash = MARF::node_copy_update(s, &mut prev_root, new_root_backptrs)?;
         
         s.open(&cur_block_hash, true)?;
@@ -4034,10 +4198,7 @@ where
         let (mut node, _) = Trie::read_root(s)?;
         let mut node_ptr = TriePtr::new(0,0,0);
 
-        let mut expected_path_len = c.path.len() + 1;   // will be incremented if we find a backptr, since it's one more step
-        let mut i = 0;
-        while i <= expected_path_len {
-            i += 1;
+        for i in 0..(c.path.len()+1) {
             let next_opt = Trie::walk_from(s, &node, &mut c)?;
             match next_opt {
                 Some((next_node_ptr, next_node, _)) => {
@@ -4047,32 +4208,43 @@ where
                     continue;
                 },
                 None => {
-                    if c.eop() {
+                    if c.div() {
+                        // we're done -- path diverged.  No node-copying can help us.
+                        test_debug!("Path diverged -- we're done.");
+                        s.open(block_hash, true)?;
+                        fseek(s, node_ptr.ptr())?;
+                        return Ok(c);
+                    }
+                    else if c.eop() {
                         // we're done
+                        test_debug!("Out of path in {:?} -- we're done. Seek to {:?}", s.tell(), &node_ptr);
+                        s.open(block_hash, true)?;
+                        fseek(s, node_ptr.ptr())?;
                         return Ok(c);
                     }
                     else {
-                        let chr = c.chr().unwrap();
+                        // we're not done with this path.  Either no node exists, or it exists off
+                        // of a prior version of the last-visited node.
+                        let chr = c.chr().unwrap();     // guaranteed to succeed since we walked some path.
                         match node {
                             TrieNodeType::BackPtr(_) => {
                                 return Err(Error::CorruptionError("Stepped to a backptr".to_string()));
                             },
                             TrieNodeType::Leaf(_) => {
-                                // at an existing leaf (with a different path); we're done
-                                c.retarget(&node, &node_ptr, &s.tell());
-                                fseek(s, node_ptr.ptr())?;
+                                // at an existing leaf with a different path.
+                                // we're done.
+                                test_debug!("Existing leaf with different path encountered at {:?} at {:?} -- we're done (not found)", &node_ptr, s.tell());
+                                s.open(block_hash, true)?;
+                                fseek_end(s)?;
                                 return Ok(c);
                             },
                             _ => {}
                         };
 
-                        // TODO: this is wrong -- need to do resolve_backptrs on (e.g.) root AND
-                        // THEN take the step.
-                        //
                         // at intermediate node whose child is not present in this trie.
-                        // bring the child forward.
+                        // bring the child forward and take the step, if possible.
                         s.open(block_hash, true)?;
-                        let (next_node, next_node_hash, next_node_ptr) = match MARF::node_child_copy(s, &node, chr) {
+                        let (next_node, next_node_hash, next_node_ptr, next_node_block_hash) = match MARF::node_child_copy(s, &node, chr) {
                             Ok(res) => {
                                 res
                             }
@@ -4080,8 +4252,10 @@ where
                                 match e {
                                     Error::BackptrNotFoundError => {
                                         // no prior version of this node has a ptr for this chr.
-                                        // we're done.
+                                        // we're done -- target node not found.
+                                        test_debug!("BackptrNotFoundError encountered at {:?} -- we're done (not found)", s.tell());
                                         s.open(block_hash, true)?;
+                                        fseek_end(s)?;
                                         return Ok(c);
                                     },
                                     _ => {
@@ -4090,15 +4264,15 @@ where
                                 }
                             }
                         };
-                        
-                        s.open(block_hash, true)?;
+
+                        // finish taking the step
+                        c.walk_backptr_resolved(&next_node_ptr, &next_node_block_hash);
                         c.retarget(&next_node, &next_node_ptr, &s.tell());
                         
                         node = next_node;
                         node_ptr = next_node_ptr;
-
-                        // will take one more step 
-                        // expected_path_len += 1;
+                        
+                        s.open(block_hash, true)?;
                     }
                 }
             }
@@ -4120,46 +4294,66 @@ where
         let (mut node, _) = Trie::read_root(s)?;
         let mut node_ptr = TriePtr::new(0,0,0);
 
-        let mut expected_path_len = c.path.len() + 1;   // will be incremented if we find a backptr, since it's one more step
-        let mut i = 0;
-        while i <= expected_path_len {
-            i += 1;
-            
+        for i in 0..(c.path.len()+1) {
             let next_opt = Trie::walk_from(s, &node, &mut c)?;
             match next_opt {
                 Some((next_node_ptr, next_node, _)) => {
-                    // keep walking 
+                    // keep walking
                     node = next_node;
                     node_ptr = next_node_ptr;
                     continue;
                 },
                 None => {
-                    if c.eop() {
+                    if c.div() {
+                        // we're done -- path diverged.  No backptr-walking can help us.
+                        test_debug!("Path diverged -- we're done.");
                         return Err(Error::NotFoundError);
                     }
                     else {
-                        let chr = c.chr().unwrap();
-                        match node {
+                        // we're not done with this path.  Either no node exists, or it exists off
+                        // of a prior version of the last-visited node.
+                        let chr = c.chr().unwrap();     // guaranteed to succeed since we walked some path.
+                        let found_leaf = match node {
                             TrieNodeType::BackPtr(_) => {
                                 return Err(Error::CorruptionError("Stepped to a backptr".to_string()));
                             },
-                            TrieNodeType::Leaf(_) => {
-                                c.retarget(&node, &node_ptr, &s.tell());
-                                fseek(s, node_ptr.ptr())?;
-                                return Ok((c, node));
+                            TrieNodeType::Leaf(ref data) => {
+                                if !c.eop() {
+                                    // at an existing leaf with a different path.
+                                    // we're done.
+                                    test_debug!("Existing but different leaf encountered at {:?} at {:?} -- we're done", &node_ptr, s.tell());
+                                    return Err(Error::NotFoundError);
+                                }
+                                else {
+                                    // we're done -- we found the leaf
+                                    true
+                                }
                             },
-                            _ => {}
+                            _ => {
+                                false
+                            }
                         };
 
-                        // at an intermediate node.  see if it's a backptr we can walk
+                        if found_leaf {
+                            return Ok((c, node));
+                        }
+
+                        // at intermediate node whose child is not present in this trie.
+                        // try to shunt to the prior node that has the child itself.
                         let (next_node, next_node_hash, next_node_ptr) = MARF::walk_backptrs(s, &node, chr)?;
+                        
+                        // finish taking the step
+                        c.walk_backptr_resolved(&next_node_ptr, &s.tell());
+                        c.retarget(&next_node, &next_node_ptr, &s.tell());
+
+                        // keep going
                         node = next_node;
                         node_ptr = next_node_ptr;
                     }
                 }
             }
         }
-
+        
         test_debug!("Trie has a cycle");
         return Err(Error::CorruptionError("Trie has a cycle".to_string()));
     }
@@ -4169,6 +4363,7 @@ where
     }
 
     pub fn get(s: &mut S, block_hash: &BlockHeaderHash, k: &TriePath) -> Result<Option<TrieLeaf>, Error> {
+        test_debug!("MARF::get({:?}) {:?}", block_hash, k);
         s.open(block_hash, false)?;
         let (c, node) = MARF::walk(s, block_hash, k)?;
 
@@ -4187,7 +4382,7 @@ where
                 },
                 _ => {
                     // Trie invariant violation -- a full path reached a non-leaf
-                    panic!("Path reached a non-leaf");
+                    return Err(Error::CorruptionError("Path reached a non-leaf".to_string()));
                 }
             }
         }
@@ -4202,20 +4397,18 @@ where
         let mut value = v.clone();
         let mut c = MARF::walk_cow(s, block_hash, k)?;
         
-        let back_bhh = s.tell();
-        
         if c.block_hashes.len() + 1 != c.node_ptrs.len() {
             test_debug!("c.block_hashes = {:?}", &c.block_hashes);
             test_debug!("c.node_ptrs = {:?}", c.node_ptrs);
             assert!(false);
         }
-
+        
         Trie::add_value(s, &mut c, &mut value)?;
         Trie::update_root_hash(s, &c)?;
         Ok(())
     }
 
-    // TODO: insert batch (avoid excessive re-hashes)
+    // TODO: insert batch? (avoid excessive re-hashes)
 }
 
 
@@ -4288,27 +4481,32 @@ impl TrieMerkleProof {
         let (node, node_hash) = Trie::read_node(s, &ptr)?;
         let all_hashes = Trie::get_children_hashes(s, &node)?;
 
+        fn make_proof_hash<T: TrieNode + std::fmt::Debug>(data: &T, all_hashes: &Vec<TrieHash>, chr: u8) -> Vec<TrieHash> {
+            let mut hashes = vec![];
+            assert!(all_hashes.len() == data.ptrs().len());
+
+            for i in 0..data.ptrs().len() {
+                if data.ptrs()[i].id() == TrieNodeID::Empty {
+                    hashes.push(TrieHash::from_data(&[]));
+                }
+                else if data.ptrs()[i].chr() != chr {
+                    hashes.push(all_hashes[i].clone());
+                }
+            }
+            assert_eq!(hashes.len(), data.ptrs().len() - 1);
+            hashes
+        }
+
         let proof_node = match node {
             TrieNodeType::BackPtr(ref data) => {
                 // shouldn't happen anyway
-                panic!("Cannot make a proof node from a backptr (at {:?}", ptr);
+                return Err(Error::CorruptionError("Read a backptr node (shoudn't be possible)".to_string()));
             },
             TrieNodeType::Leaf(ref data) => {
                 TrieMerkleProofType::Leaf((chr, data.clone()))
             },
             TrieNodeType::Node4(ref data) => {
-                let mut hashes = vec![];
-                assert!(all_hashes.len() == data.ptrs.len());
-
-                for i in 0..4 {
-                    if data.ptrs[i].id() == TrieNodeID::Empty {
-                        hashes.push(TrieHash::from_data(&[]));
-                    }
-                    else if data.ptrs[i].chr() != chr {
-                        hashes.push(all_hashes[i].clone());
-                    }
-                }
-                assert_eq!(hashes.len(), 3);
+                let hashes = make_proof_hash(data, &all_hashes, chr);
 
                 let mut hash_slice = [TrieHash::from_data(&[]); 3];
                 hash_slice.copy_from_slice(&hashes[0..3]);
@@ -4316,18 +4514,7 @@ impl TrieMerkleProof {
                 TrieMerkleProofType::Node4((chr, data.clone(), hash_slice))
             },
             TrieNodeType::Node16(ref data) => {
-                let mut hashes = vec![];
-                assert!(all_hashes.len() == data.ptrs.len());
-
-                for i in 0..16 {
-                    if data.ptrs[i].id() == TrieNodeID::Empty {
-                        hashes.push(TrieHash::from_data(&[]));
-                    }
-                    else if data.ptrs[i].chr() != chr {
-                        hashes.push(all_hashes[i].clone());
-                    }
-                }
-                assert_eq!(hashes.len(), 15);
+                let hashes = make_proof_hash(data, &all_hashes, chr);
                 
                 let mut hash_slice = [TrieHash::from_data(&[]); 15];
                 hash_slice.copy_from_slice(&hashes[0..15]);
@@ -4335,18 +4522,7 @@ impl TrieMerkleProof {
                 TrieMerkleProofType::Node16((chr, data.clone(), hash_slice))
             },
             TrieNodeType::Node48(ref data) => {
-                let mut hashes = vec![];
-                assert!(all_hashes.len() == data.ptrs.len());
-
-                for i in 0..48 {
-                    if data.ptrs[i].id() == TrieNodeID::Empty {
-                        hashes.push(TrieHash::from_data(&[]));
-                    }
-                    else if data.ptrs[i].chr() != chr {
-                        hashes.push(all_hashes[i].clone());
-                    }
-                }
-                assert_eq!(hashes.len(), 47);
+                let hashes = make_proof_hash(data, &all_hashes, chr);
                 
                 let mut hash_slice = [TrieHash::from_data(&[]); 47];
                 hash_slice.copy_from_slice(&hashes[0..47]);
@@ -4354,18 +4530,7 @@ impl TrieMerkleProof {
                 TrieMerkleProofType::Node48((chr, data.clone(), hash_slice))
             },
             TrieNodeType::Node256(ref data) => {
-                let mut hashes = vec![];
-                assert!(all_hashes.len() == data.ptrs.len());
-
-                for i in 0..256 {
-                    if data.ptrs[i].id() == TrieNodeID::Empty {
-                        hashes.push(TrieHash::from_data(&[]));
-                    }
-                    else if data.ptrs[i].chr() != chr {
-                        hashes.push(all_hashes[i].clone());
-                    }
-                }
-                assert_eq!(hashes.len(), 255);
+                let hashes = make_proof_hash(data, &all_hashes, chr);
 
                 let mut hash_slice = [TrieHash::from_data(&[]); 255];
                 hash_slice.copy_from_slice(&hashes[0..255]);
@@ -4639,8 +4804,10 @@ mod test {
                 if ptr.id() == TrieNodeID::Empty {
                     continue;
                 }
-                let (child_node, _) = Trie::read_node(s, ptr).unwrap();
-                frontier.push((child_node, depth + path_len + 1));
+                if !is_backptr(ptr.id()) {
+                    let (child_node, _) = Trie::read_node(s, ptr).unwrap();
+                    frontier.push((child_node, depth + path_len + 1));
+                }
             }
         }
         
@@ -4660,6 +4827,7 @@ mod test {
     }
     
     fn merkle_test_marf<S: TrieStorage + Seek>(s: &mut S, header: &BlockHeaderHash, path: &Vec<u8>, value: &Vec<u8>) -> () {
+        test_debug!("merkle_test_marf({:?}, {:?}, {:?})?", header, path, value);
         s.open(header, false).unwrap();
         let (_, root_hash) = Trie::read_root(s).unwrap();
         let triepath = TriePath::from_bytes(&path[..]).unwrap();
@@ -4710,9 +4878,9 @@ mod test {
     fn trie_node4_to_bytes_backptrs() {
         let mut node4 = TrieNode4::new(&vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]);
         node4.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         for i in 0..3 {
@@ -4782,9 +4950,9 @@ mod test {
     fn trie_node4_to_consensus_bytes_backptrs() {
         let mut node4 = TrieNode4::new(&vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]);
         node4.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         for i in 0..3 {
@@ -4868,9 +5036,9 @@ mod test {
     fn trie_node16_to_bytes_backptrs() {
         let mut node16 = TrieNode16::new(&vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]);
         node16.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         for i in 0..3 {
@@ -4964,9 +5132,9 @@ mod test {
     fn trie_node16_to_consensus_bytes_backptrs() {
         let mut node16 = TrieNode16::new(&vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]);
         node16.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         for i in 0..3 {
@@ -5132,9 +5300,9 @@ mod test {
             assert!(node48.insert(&TriePtr::new(TrieNodeID::Node256, (i+1) as u8, (i+2) as u64)));
         }
         node48.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
         let node48_bytes = vec![
             // node ID
@@ -5358,9 +5526,9 @@ mod test {
             assert!(node48.insert(&TriePtr::new(TrieNodeID::Node256, (i+1) as u8, (i+2) as u64)));
         }
         node48.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
         let node48_bytes = vec![
             // node ID
@@ -5479,9 +5647,9 @@ mod test {
             assert!(node256.insert(&TriePtr::new(TrieNodeID::Node256, i as u8, (i+2) % 256)));
         }
         node256.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         let mut node256_bytes = vec![
@@ -5577,9 +5745,9 @@ mod test {
             assert!(node256.insert(&TriePtr::new(TrieNodeID::Node256, i as u8, (i+2) % 256)));
         }
         node256.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         let mut node256_bytes = vec![
@@ -5693,9 +5861,9 @@ mod test {
             &vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39]
         );
         leaf.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         let mut buf = vec![];
@@ -5739,7 +5907,8 @@ mod test {
     fn trie_backptr_to_bytes() {
         let backptr = TrieBackPtr::new(
             &BlockHeaderHash::from_bytes(&[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]).unwrap(),
-            &TriePtr::new(TrieNodeID::Node256, 32, 33)
+            &TriePtr::new(TrieNodeID::Node256, 32, 33),
+            &TrieHash([0u8; 32])
         );
         let mut buf = vec![];
         backptr.to_bytes(&mut buf);
@@ -5751,7 +5920,9 @@ mod test {
                         // ptrs (1)
                         TrieNodeID::Node256, 32, 0, 0, 0, 0, 0, 0, 0, 33,
                         // header hash
-                        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+                        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                        // node hash
+                        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
                     ]);
         
         assert_eq!(backptr.byte_len(), buf.len());
@@ -5761,7 +5932,8 @@ mod test {
     fn trie_backptr_to_consensus_bytes() {
         let backptr = TrieBackPtr::new(
             &BlockHeaderHash::from_bytes(&[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]).unwrap(),
-            &TriePtr::new(TrieNodeID::Node256, 32, 33)
+            &TriePtr::new(TrieNodeID::Node256, 32, 33),
+            &TrieHash([0u8; 32])
         );
         let mut buf = vec![];
         backptr.to_consensus_bytes(&mut buf);
@@ -5772,7 +5944,9 @@ mod test {
                         // ptrs (1)
                         TrieNodeID::Node256, 32, 0, 0, 0, 0, 0, 0, 0, 33,
                         // block header hash
-                        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+                        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                        // node hash
+                        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
                     ]);
     }
 
@@ -5803,9 +5977,9 @@ mod test {
             assert!(node4.insert(&TriePtr::new(TrieNodeID::Node16, (i+1) as u8, (i+2) as u64)));
         }
         node4.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
         
         let f = Cursor::new(vec![]);
@@ -5847,9 +6021,9 @@ mod test {
             assert!(node16.insert(&TriePtr::new(TrieNodeID::Node48, (i+1) as u8, (i+2) as u64)));
         }
         node16.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         let f = Cursor::new(vec![]);
@@ -5891,9 +6065,9 @@ mod test {
             assert!(node48.insert(&TriePtr::new(TrieNodeID::Node256, (i+1) as u8, (i+2) as u64)));
         }
         node48.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
         let f = Cursor::new(vec![]);
         let mut cursor = TrieIOBuffer::new(f);
@@ -5934,9 +6108,9 @@ mod test {
             assert!(node256.insert(&TriePtr::new(TrieNodeID::Node256, (i+1) as u8, (i+2) as u64)));
         }
         node256.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
         let f = Cursor::new(vec![]);
         let mut cursor = TrieIOBuffer::new(f);
@@ -5978,9 +6152,9 @@ mod test {
             &vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39]
         );
         leaf.backptrs = vec![
-            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3)),
-            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6)),
-            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9)),
+            TrieBackPtr::new(&BlockHeaderHash([0u8; 32]), &TriePtr::new(1,2,3), &TrieHash([0u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([1u8; 32]), &TriePtr::new(4,5,6), &TrieHash([1u8; 32])),
+            TrieBackPtr::new(&BlockHeaderHash([2u8; 32]), &TriePtr::new(7,8,9), &TrieHash([2u8; 32])),
         ];
 
         let f = Cursor::new(vec![]);
@@ -6000,7 +6174,8 @@ mod test {
     fn read_write_backptr() {
         let backptr = TrieBackPtr::new(
             &BlockHeaderHash::from_bytes(&[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]).unwrap(), 
-            &TriePtr::new(TrieNodeID::Node256, 32, 33)
+            &TriePtr::new(TrieNodeID::Node256, 32, 33),
+            &TrieHash([0u8; 32])
         );
 
         let f = Cursor::new(vec![]);
@@ -8227,9 +8402,77 @@ mod test {
             }
         }
     }
+    
+    #[test]
+    fn marf_insert_different_leaf_same_block_100() {
+        let cursor = Cursor::new(vec![]);
+        let mut f = TrieIOBuffer::new(cursor);
+
+        let block_header_1 = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
+        MARF::format(&mut f, &block_header_1).unwrap();
+
+        let path_bytes = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+        let path = TriePath::from_bytes(&path_bytes).unwrap();
+        let block_header = BlockHeaderHash::from_bytes(&[0; 32]).unwrap();
+
+        for i in 0..100 {
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            MARF::insert(&mut f, &block_header, &path, &value).unwrap();
+        }
+        
+        test_debug!("---------");
+        test_debug!("MARF gets");
+        test_debug!("---------");
+
+        let value = TrieLeaf::new(&vec![], &[99; 40].to_vec());
+        let leaf = MARF::get(&mut f, &block_header, &path).unwrap().unwrap();
+
+        assert_eq!(leaf.reserved.to_vec(), [99; 40].to_vec());
+        assert_eq!(f.tell(), block_header);
+        assert_eq!(leaf.backptrs.len(), 0);
+
+        merkle_test_marf(&mut f, &block_header, &path_bytes.to_vec(), &[99; 40].to_vec());
+    }
+    
+    #[test]
+    fn marf_insert_different_leaf_different_path_different_block_100() {
+        let cursor = Cursor::new(vec![]);
+        let mut f = TrieIOBuffer::new(cursor);
+
+        let block_header_1 = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
+        MARF::format(&mut f, &block_header_1).unwrap();
+
+        for i in 0..100 {
+            test_debug!("insert {}", i);
+            let block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let path_bytes = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,i as u8];
+            let path = TriePath::from_bytes(&path_bytes).unwrap();
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            MARF::insert(&mut f, &block_header, &path, &value).unwrap();
+        }
+        
+        test_debug!("---------");
+        test_debug!("MARF gets");
+        test_debug!("---------");
+
+        for i in 0..100 {
+            let block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let path_bytes = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,i as u8];
+            let path = TriePath::from_bytes(&path_bytes).unwrap();
+
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            let leaf = MARF::get(&mut f, &block_header, &path).unwrap().unwrap();
+
+            assert_eq!(leaf.reserved.to_vec(), [i as u8; 40].to_vec());
+            assert_eq!(f.tell(), block_header);
+            assert_eq!(leaf.backptrs.len(), 0);
+
+            merkle_test_marf(&mut f, &block_header, &path_bytes.to_vec(), &[i as u8; 40].to_vec());
+        }
+    }
 
     #[test]
-    fn marf_insert_same_leaf_100() {
+    fn marf_insert_same_leaf_different_block_100() {
         let cursor = Cursor::new(vec![]);
         let mut f = TrieIOBuffer::new(cursor);
 
@@ -8245,17 +8488,59 @@ mod test {
             MARF::insert(&mut f, &next_block_header, &path, &value).unwrap();
         }
         
-        let last_block_header = BlockHeaderHash::from_bytes(&[99; 32]).unwrap();
+        test_debug!("---------");
+        test_debug!("MARF gets");
+        test_debug!("---------");
 
         for i in 0..100 {
-            f.open(&last_block_header, false).unwrap();
             let next_block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            let leaf = MARF::get(&mut f, &next_block_header, &path).unwrap().unwrap();
+
+            assert_eq!(leaf.reserved.to_vec(), [i as u8; 40].to_vec());
+            assert_eq!(f.tell(), next_block_header);
+            assert_eq!(leaf.backptrs.len(), 0);
+
+            merkle_test_marf(&mut f, &next_block_header, &path_bytes.to_vec(), &[i as u8; 40].to_vec());
+        }
+    }
+    
+    #[test]
+    fn marf_insert_leaf_sequence_100() {
+        let cursor = Cursor::new(vec![]);
+        let mut f = TrieIOBuffer::new(cursor);
+
+        let block_header_1 = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
+        MARF::format(&mut f, &block_header_1).unwrap();
+
+        for i in 0..100 {
+            let path_bytes = [i as u8,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+            let path = TriePath::from_bytes(&path_bytes).unwrap();
+
+            let next_block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            MARF::insert(&mut f, &next_block_header, &path, &value).unwrap();
+        }
+        
+        let last_block_header = BlockHeaderHash::from_bytes(&[99; 32]).unwrap();
+
+        test_debug!("---------");
+        test_debug!("MARF gets");
+        test_debug!("---------");
+
+        for i in 0..100 {
+            let next_block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let path_bytes = [i as u8,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+            let path = TriePath::from_bytes(&path_bytes).unwrap();
+            
             let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
             let leaf = MARF::get(&mut f, &last_block_header, &path).unwrap().unwrap();
 
             assert_eq!(leaf.reserved.to_vec(), [i as u8; 40].to_vec());
             assert_eq!(f.tell(), next_block_header);
-            assert_eq!(leaf.backptrs.len() as u64, log2_floor(i)+1);
+            assert_eq!(leaf.backptrs.len(), 0);
+
+            merkle_test_marf(&mut f, &last_block_header, &path_bytes.to_vec(), &[i as u8; 40].to_vec());
         }
     }
 
@@ -8349,7 +8634,6 @@ mod test {
             // verify that all non-empty ptrs in all intermediate nodes are BackPtrs
             let c = marf_verify_cow(&mut f, &next_block_header, &next_path);
             let mut leaf_count = 0;
-            let mut backptr_count = 0;
             for node in c.nodes.iter() {
                 let ptrs = match node {
                     TrieNodeType::Node4(ref data) => data.ptrs.to_vec(),
@@ -8363,9 +8647,6 @@ mod test {
                     if ptr.id() == TrieNodeID::Leaf {
                         leaf_count += 1;
                     }
-                    else if ptr.id() != TrieNodeID::Empty {
-                        backptr_count += 1;
-                    }
                 }
             }
 
@@ -8374,9 +8655,6 @@ mod test {
             // only one leaf in this trie
             assert_eq!(leaf_count, 1);
            
-            // should not see any backptrs
-            assert_eq!(backptr_count, 0);
-
             merkle_test_marf(&mut f, &next_block_header, &next_path, &[i as u8; 40].to_vec());
         }
 
@@ -9090,6 +9368,132 @@ mod test {
         }
     }
     
+    #[test]
+    fn marf_read_random_1048576_4096_file_storage() {
+        let path = "/tmp/rust_marf_insert_random_1048576_4096".to_string();
+        match fs::metadata(&path) {
+            Err(_) => {
+                println!("Run the marf_insert_random_1048576_4096 test first");
+                return;
+            },
+            Ok(_) => {}
+        };
+        let mut f = TrieFileStorage::new(&path).unwrap();
+
+        let block_header = BlockHeaderHash::from_bytes(&[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0xf0,0xff,0xff]).unwrap();
+        f.open(&block_header, false).unwrap();
+
+        let mut seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+        let mut start_time = 0;
+
+        start_time = get_epoch_time_ms();
+        for i in 0..1048576 {
+            // can read them all back
+            let i0 = (i & 0xff0000) >> 12;
+            let i1 = (i & 0x00ff00) >> 8;
+            let i2 = i & 0x0000ff;
+            
+            let path = TrieHash::from_data(&seed[..]).as_bytes()[0..20].to_vec();
+            seed = path.clone();
+
+            let triepath = TriePath::from_bytes(&path[..]).unwrap(); 
+            let value = TrieLeaf::new(&vec![], &[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,i0 as u8, i1 as u8, i2 as u8].to_vec());
+
+            let read_value = MARF::get(&mut f, &block_header, &TriePath::from_bytes(&path[..]).unwrap()).unwrap().unwrap();
+            assert_eq!(read_value.reserved.to_vec(), value.reserved.to_vec());
+            
+            // can make a merkle proof to each one
+            // merkle_test_marf(&mut f, &block_header, &path.to_vec(), &value.reserved.to_vec());
+            if i % 128 == 0 {
+                let end_time = get_epoch_time_ms();
+                let (read_count, write_count) = f.stats();
+                let (node_reads, backptr_reads, node_writes, backptr_writes) = f.node_stats();
+                let (leaf_reads, leaf_writes) = f.leaf_stats();
+                println!("Got {} in {} (1 get = {} ms).  Read = {}, Write = {}, Node Reads = {}, Node Writes = {}, Backptr Reads = {}, BackPtr Writes = {}, Leaf Reads = {}, Leaf Writes = {}",
+                         i, end_time - start_time, ((end_time - start_time) as f64) / 128.0, read_count, write_count, node_reads, node_writes, backptr_reads, backptr_writes, leaf_reads, leaf_writes);
+                
+                start_time = get_epoch_time_ms();
+            }
+        }
+    }
+    
+    // insert a range of 4096 consecutive keys (forcing node promotions) by varying the low-order bits.
+    // every 128 keys, make a new trie.
+    // Use the TrieFileStorage backend
+    #[test]
+    fn marf_insert_128_32_file_storage() {
+        let path = "/tmp/rust_marf_insert_128_32_file_storage".to_string();
+        match fs::metadata(&path) {
+            Ok(_) => {
+                fs::remove_dir_all(&path).unwrap();
+            },
+            Err(_) => {}
+        };
+
+        let mut f = TrieFileStorage::new(&path).unwrap();
+
+        let mut block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
+        MARF::format(&mut f, &block_header).unwrap();
+
+        for i in 0..128 {
+            let i0 = i / 256;
+            let i1 = i % 256;
+            let path = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,i0 as u8, i1 as u8];
+
+            let triepath = TriePath::from_bytes(&path[..]).unwrap(); 
+            let value = TrieLeaf::new(&vec![], &[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,i0 as u8, i1 as u8].to_vec());
+
+            if (i + 1) % 32 == 0 {
+                // next block
+                block_header = BlockHeaderHash::from_bytes(&[((i + 1) / 32) as u8; 32]).unwrap();
+                test_debug!("block header is now {:?}", &block_header);
+                f.flush().unwrap();
+            }
+
+            test_debug!("insert {}", i);
+            MARF::insert(&mut f, &block_header, &triepath, &value).unwrap();
+             
+            test_debug!("get {}", i);
+            let read_value = MARF::get(&mut f, &block_header, &TriePath::from_bytes(&path[..]).unwrap()).unwrap().unwrap();
+            assert_eq!(read_value.reserved.to_vec(), value.reserved.to_vec());
+            assert_eq!(f.tell(), block_header);
+            
+            // can make a merkle proof to each one
+            // merkle_test_marf(&mut f, &block_header, &path.to_vec(), &value.reserved.to_vec());
+        }
+        
+        f.flush().unwrap();
+
+        f.open(&block_header, false).unwrap();
+        dump_trie(&mut f);
+
+        test_debug!("------------");
+        test_debug!("get all and get merkle proofs");
+        test_debug!("------------");
+
+        for i in 0..128 {
+            // can read them all back
+            let i0 = i / 256;
+            let i1 = i % 256;
+            let path = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,i0 as u8, i1 as u8];
+
+            let triepath = TriePath::from_bytes(&path[..]).unwrap(); 
+            let value = TrieLeaf::new(&vec![], &[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,i0 as u8, i1 as u8].to_vec());
+
+            let read_value = MARF::get(&mut f, &block_header, &TriePath::from_bytes(&path[..]).unwrap()).unwrap().unwrap();
+            assert_eq!(read_value.reserved.to_vec(), value.reserved.to_vec());
+            
+            // can make a merkle proof to each one
+            merkle_test_marf(&mut f, &block_header, &path.to_vec(), &value.reserved.to_vec());
+        }
+
+        for i in 0..(128/32) {
+            let block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            f.open(&block_header, false).unwrap();
+            dump_trie(&mut f);
+        }
+    }
+
     // insert a range of 4096 consecutive keys (forcing node promotions) by varying the low-order bits.
     // every 128 keys, make a new trie.
     // Use the TrieFileStorage backend
@@ -9117,19 +9521,29 @@ mod test {
             let value = TrieLeaf::new(&vec![], &[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,i0 as u8, i1 as u8].to_vec());
 
             if (i + 1) % 128 == 0 {
-                // next block 
+                // next block
                 block_header = BlockHeaderHash::from_bytes(&[((i + 1) / 128) as u8; 32]).unwrap();
+                test_debug!("block header is now {:?}", &block_header);
                 f.flush().unwrap();
             }
 
+            test_debug!("insert {}", i);
             MARF::insert(&mut f, &block_header, &triepath, &value).unwrap();
              
+            test_debug!("get {}", i);
             let read_value = MARF::get(&mut f, &block_header, &TriePath::from_bytes(&path[..]).unwrap()).unwrap().unwrap();
             assert_eq!(read_value.reserved.to_vec(), value.reserved.to_vec());
             assert_eq!(f.tell(), block_header);
+            
+            // can make a merkle proof to each one
+            // merkle_test_marf(&mut f, &block_header, &path.to_vec(), &value.reserved.to_vec());
         }
         
         f.flush().unwrap();
+
+        test_debug!("------------");
+        test_debug!("get all and get merkle proofs");
+        test_debug!("------------");
 
         for i in 0..4096 {
             // can read them all back
