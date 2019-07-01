@@ -21,6 +21,8 @@ use std::path::{
     PathBuf
 };
 
+use std::ptr;
+
 use sha2::Sha512Trunc256;
 use sha2::Digest;
 
@@ -287,12 +289,14 @@ macro_rules! impl_byte_array_newtype {
     }
 }
 
+const PERF_TEST: bool = true;
+
 // print debug statements while testing
 #[allow(unused_macros)]
 macro_rules! test_debug {
     ($($arg:tt)*) => ({
         use std::env;
-        if env::var("BLOCKSTACK_DEBUG") == Ok("1".to_string()) {
+        if !PERF_TEST && env::var("BLOCKSTACK_DEBUG") == Ok("1".to_string()) {
             let file = file!();
             let lineno = line!();
             let s1 = format!("[{}:{}] ", file, lineno);
@@ -399,22 +403,32 @@ pub const BLOCK_HEADER_HASH_ENCODED_SIZE : u32 = 32;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Fast log-base-2 floor of a u64.
-/// Finds the offset of the highest bit set and returns it.
-#[inline]
 fn log2_floor(k: u64) -> u64 {
-    let mut r = 63;
-    let mut mask = 1u64 << 63;
-    while r > 0 {
-        if (k & mask) != 0 {
-            return r;
-        }
-        r -= 1;
-        mask >>= 1;
+    if k == 0 {
+        0
     }
-    0
+    else {
+        63u64 - (k.leading_zeros() as u64)
+    }
 }
 
+/// Fast extend-from-slice for bytes.  Basically, this is memcpy(3).
+/// This is similar to the private append_elemnts() method in the Vec struct,
+/// but slightly faster in that it requires that target already have sufficient capacity.
+/// Based on https://doc.rust-lang.org/std/ptr/fn.copy_nonoverlapping.html
+#[inline]
+fn fast_extend_from_slice(target: &mut Vec<u8>, src: &[u8]) -> () {
+    assert!(target.capacity() >= target.len() + src.len());
+    let target_len = target.len();
+    let src_len = src.len();
+    let new_len = target_len + src_len;
+    unsafe {
+        let target_ptr = target.as_mut_ptr().offset(target_len as isize);
+        let src_ptr = src.as_ptr();
+        ptr::copy_nonoverlapping(src_ptr, target_ptr, src_len);
+        target.set_len(new_len);
+    }
+}
 
 pub struct TrieHash(pub [u8; 32]);
 impl_array_newtype!(TrieHash, u8, 32);
@@ -659,6 +673,8 @@ impl TriePtr {
         let ptr = self.ptr();
 
         let ptr_bytes = [
+            self.id(),
+            self.chr(),
             ((ptr & 0xff00000000000000) >> 56) as u8,
             ((ptr & 0x00ff000000000000) >> 48) as u8,
             ((ptr & 0x0000ff0000000000) >> 40) as u8,
@@ -668,25 +684,13 @@ impl TriePtr {
             ((ptr & 0x000000000000ff00) >> 8) as u8,
             ((ptr & 0x00000000000000ff)) as u8
         ];
-
-        buf.push(self.id());
-        buf.push(self.chr());
-
-        buf.push(ptr_bytes[0]);
-        buf.push(ptr_bytes[1]);
-        buf.push(ptr_bytes[2]);
-        buf.push(ptr_bytes[3]);
-        buf.push(ptr_bytes[4]);
-        buf.push(ptr_bytes[5]);
-        buf.push(ptr_bytes[6]);
-        buf.push(ptr_bytes[7]);
+        fast_extend_from_slice(buf, &ptr_bytes);
     }
 
     #[inline]
     pub fn to_consensus_bytes(&self, buf: &mut Vec<u8>) -> () {
         // like to_bytes(), but without insertion-order
-        buf.push(self.id());
-        buf.push(self.chr());
+        fast_extend_from_slice(buf, &[self.id(), self.chr()]);
     }
 
     #[inline]
@@ -863,12 +867,13 @@ impl TrieCursor {
                 Some(ref ptr) => {
                     if !is_backptr(ptr.id()) {
                         // already resolved
-                        self.walk_backptr_resolved(&ptr, block_hash);
+                        self.walk_backptr_finish(&ptr, block_hash);
                         true
                     }
                     else {
                         // the caller will need to follow the backptr, and call
-                        // walk_backptr_resolved() with the ptr and block_hash followed.
+                        // walk_backptr_step() for each node visited, and then walk_backptr_finish()
+                        // once the final ptr and block_hash are discovered.
                         false
                     }
                 },
@@ -882,7 +887,7 @@ impl TrieCursor {
             }
 
             if ptr_opt.is_none() {
-                test_debug!("cursor: not found: chr = {:x}, self.index = {}, self.path = {:?}", chr, self.index-1, &path_bytes);
+                test_debug!("cursor: not found: chr = 0x{:02x}, self.index = {}, self.path = {:?}", chr, self.index-1, &path_bytes);
             }
             ptr_opt
         }
@@ -892,7 +897,33 @@ impl TrieCursor {
         }
     }
 
-    pub fn walk_backptr_resolved(&mut self, ptr: &TriePtr, block_hash: &BlockHeaderHash) -> () {
+    /// Record that a node was walked to by way of a backptr while walking backptrs.
+    /// next_node should be the node walked to.
+    /// ptr is the ptr we'll be walking from, off of next_node.
+    /// block_hash is the block where next_node came from.
+    pub fn walk_backptr_step_backptr(&mut self, next_node: &TrieNodeType, ptr: &TriePtr, block_hash: &BlockHeaderHash) -> () {
+        let backptr = TriePtr::new(set_backptr(ptr.id()), ptr.chr(), ptr.ptr());        // set_backptr() informs update_root_hash() to skip this node
+        self.node_ptrs.push(backptr);
+        self.block_hashes.push(block_hash.clone());
+        
+        self.nodes.push(next_node.clone());
+        test_debug!("Cursor: walk_backptr_step_backptr ptr={:?} block_hash={:?} next_node={:?}", ptr, block_hash, next_node);
+    }
+    
+    /// Record that a node was alked to by way of a storage ptr while walking backptrs.
+    /// ptr and block hash refer to the location of next_node.
+    pub fn walk_backptr_step_node(&mut self, next_node: &TrieNodeType, ptr: &TriePtr, block_hash: &BlockHeaderHash) -> () {
+        let backptr = TriePtr::new(set_backptr(ptr.id()), ptr.chr(), ptr.ptr());        // set_backptr() informs update_root_hash() to skip this node
+        self.node_ptrs.push(backptr);
+        self.block_hashes.push(block_hash.clone());
+        
+        self.nodes.push(next_node.clone());
+    }
+
+    /// Finish walking a skiplist of backptrs and record the location of the non-backptr node we landed on.
+    pub fn walk_backptr_finish(&mut self, ptr: &TriePtr, block_hash: &BlockHeaderHash) -> () {
+        assert!(!is_backptr(ptr.id()));
+
         self.node_ptrs.push(ptr.clone());
         self.block_hashes.push(block_hash.clone());
     }
@@ -1767,7 +1798,8 @@ impl TrieNode for TrieLeaf {
         let id = backptr_id(TrieNodeID::Leaf, &self.backptrs);
         ret.push(id);
         path_to_bytes(&self.path, ret);
-        ret.extend_from_slice(&self.reserved);
+        // ret.extend_from_slice(&self.reserved);
+        fast_extend_from_slice(ret, &self.reserved);
         backptrs_to_bytes(&self.backptrs, ret);
     }
 
@@ -1853,14 +1885,18 @@ impl TrieNode for TrieBackPtr {
 
     fn to_bytes(&self, ret: &mut Vec<u8>) -> () {
         ptrs_to_bytes(TrieNodeID::BackPtr, &[self.ptr], ret);
-        ret.extend_from_slice(self.block_hash.as_bytes());
-        ret.extend_from_slice(self.hash.as_bytes());
+        // ret.extend_from_slice(self.block_hash.as_bytes());
+        // ret.extend_from_slice(self.hash.as_bytes());
+        fast_extend_from_slice(ret, self.block_hash.as_bytes());
+        fast_extend_from_slice(ret, self.hash.as_bytes());
     }
 
     fn to_consensus_bytes(&self, buf: &mut Vec<u8>) -> () {
         ptrs_to_bytes(TrieNodeID::BackPtr, &[self.ptr], buf);   // NOTE: not ptrs_to_consensus_bytes -- need to preserve backptr depth
-        buf.extend_from_slice(self.block_hash.as_bytes());
-        buf.extend_from_slice(self.hash.as_bytes());
+        // buf.extend_from_slice(self.block_hash.as_bytes());
+        // buf.extend_from_slice(self.hash.as_bytes());
+        fast_extend_from_slice(buf, self.block_hash.as_bytes());
+        fast_extend_from_slice(buf, self.hash.as_bytes());
     }
     
     fn byte_len(&self) -> usize {
@@ -1966,7 +2002,14 @@ fn get_node_hash_bytes<T: TrieNode + std::fmt::Debug>(node: &T, child_hash_bytes
     let ret = TrieHash(res);
 
     if child_hash_bytes.len() >= 50 {
-        test_debug!("get_node_hash_bytes: hash {:?} = {:?} + {:?}... ({})", &ret, node, &child_hash_bytes[0..50], child_hash_bytes.len());
+        // extract individual hashes
+        let mut all_hashes = Vec::with_capacity(child_hash_bytes.len() / TRIEHASH_ENCODED_SIZE);
+        for i in 0..child_hash_bytes.len() / TRIEHASH_ENCODED_SIZE {
+            let mut h_slice = [0u8; TRIEHASH_ENCODED_SIZE];
+            h_slice.copy_from_slice(&child_hash_bytes[TRIEHASH_ENCODED_SIZE*i..TRIEHASH_ENCODED_SIZE*(i+1)]);
+            all_hashes.push(TrieHash(h_slice))
+        }
+        test_debug!("get_node_hash_bytes: hash {:?} = {:?} + {:?}... ({})", &ret, node, &all_hashes, child_hash_bytes.len());
     }
     else {
         test_debug!("get_node_hash_bytes: hash {:?} = {:?} + {:?}... ({})", &ret, node, &child_hash_bytes, child_hash_bytes.len());
@@ -1979,7 +2022,8 @@ fn _read_hash_bytes<F: Read + Write + Seek>(f: &mut F, buf: &mut Vec<u8>) -> Res
     let mut hashbytes = [0u8; 32];
     f.read(&mut hashbytes)
         .map_err(Error::IOError)?;
-    buf.extend_from_slice(&hashbytes);
+    // buf.extend_from_slice(&hashbytes);
+    fast_extend_from_slice(buf, &hashbytes);
     Ok(())
 }
 
@@ -2064,7 +2108,8 @@ fn get_node_byte_len(node: &TrieNodeType) -> usize {
 fn write_node_bytes<F: Read + Write + Seek, T: TrieNode + std::fmt::Debug>(f: &mut F, node: &T, hash: TrieHash) -> Result<usize, Error> {
     let mut cnt = 0;
     let mut bytes = Vec::with_capacity(node.byte_len() + TRIEHASH_ENCODED_SIZE);
-    bytes.extend_from_slice(hash.as_bytes());
+    // bytes.extend_from_slice(hash.as_bytes());
+    fast_extend_from_slice(&mut bytes, hash.as_bytes());
     node.to_bytes(&mut bytes);
     
     assert_eq!(bytes.len(), node.byte_len() + TRIEHASH_ENCODED_SIZE);
@@ -2388,7 +2433,8 @@ impl TrieStorage for TrieRAM {
             Err(Error::NotFoundError)
         }
         else {
-            buf.extend_from_slice(self.data[ptr.ptr() as usize].1.as_bytes());
+            // buf.extend_from_slice(self.data[ptr.ptr() as usize].1.as_bytes());
+            fast_extend_from_slice(buf, self.data[ptr.ptr() as usize].1.as_bytes());
             Ok(())
         }
     }
@@ -3273,9 +3319,10 @@ where
  
     /// Given a node's backptrs and a child ptr of interest, walk the backptrs back and read the child node that
     /// the ptr points to.
+    /// Each node, ptr, and hash visited will be added to the cursor.
     /// s will point to the last block header visited.  On Ok, this is the block header of the
     /// target node.
-    fn walk_backptrs(s: &mut S, backptrs: &Vec<TrieBackPtr>, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
+    fn walk_backptrs(s: &mut S, backptrs: &Vec<TrieBackPtr>, ptr: &TriePtr, c: &mut TrieCursor) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
         test_debug!("Walk backptrs to {:?}: {:?}", backptrs, ptr);
         if !is_backptr(ptr.id()) {
             // child is in this block 
@@ -3283,7 +3330,7 @@ where
                 // shouldn't happen 
                 return Err(Error::CorruptionError("ptr is empty".to_string()));
             }
-            let (node, node_hash) = s.read_node(&ptr)?;
+            let (node, node_hash) = s.read_node(ptr)?;
             return Ok((node, node_hash, ptr.clone()));
         }
 
@@ -3299,8 +3346,7 @@ where
 
         while depth > 0 {
             let bi = log2_floor(depth) as usize;
-            test_debug!("depth = {}, cur_backptrs = {:?}", depth, &cur_backptrs);
-            test_debug!("skip to {} in {:?}", bi, &cur_backptrs);
+            test_debug!("depth = {}, cur_backptrs = {:?}: skip to {} in {:?}", depth, &cur_backptrs, bi, &cur_backptrs);
 
             if bi >= cur_backptrs.len() {
                 // corrupt
@@ -3311,9 +3357,11 @@ where
             let backptr = cur_backptrs[bi].clone();
             s.open(&backptr.block_hash, false)?;
 
-            // as a hint, set the backptr bit on this node's ID
             let backptr_ptr = TriePtr::new(set_backptr(backptr.ptr.id()), backptr.ptr.chr(), backptr.ptr.ptr());
             let (next_node, next_hash) = s.read_node(&backptr_ptr)?;
+
+            // stepped via a backptr
+            c.walk_backptr_step_backptr(&next_node, &backptr_ptr, &s.tell());
 
             // next backptrs
             let (next_backptrs, next_ptr_opt) = match next_node {
@@ -3346,6 +3394,8 @@ where
             if !is_backptr(next_ptr.id()) {
                 // found!
                 let (node, node_hash) = s.read_node(&next_ptr)?;
+
+                // stepped via a storage ptr
                 return Ok((node, node_hash, next_ptr));
             }
             else {
@@ -3373,17 +3423,22 @@ where
             let ptr = &ptrs[i];
             if ptr.id() == TrieNodeID::Empty {
                 // hash of empty string
-                buf.extend_from_slice(TrieHash::from_data(&[]).as_bytes());
+                // buf.extend_from_slice(TrieHash::from_data(&[]).as_bytes());
+                fast_extend_from_slice(buf, TrieHash::from_data(&[]).as_bytes());
             }
             else if !is_backptr(ptr.id()) {
                 // hash is in the same block as this node
                 s.read_node_hash_bytes(ptr, buf)?;
             }
             else {
-                // set hash to be the hash of the first prior node we'd step to
+                // set hash to be the hash of the first prior node we'd step to when resolving it.
+                // the hash of _that_ node is calculated over the hash of its backptrs, each of
+                // which is calculated over its backptrs, etc., which is eventually calculated over
+                // the child in question
                 let backptr_idx = log2_floor(ptr.ptr());
                 assert!(backptr_idx < (backptrs.len() as u64));
-                buf.extend_from_slice(backptrs[backptr_idx as usize].hash.as_bytes());
+                // buf.extend_from_slice(backptrs[backptr_idx as usize].hash.as_bytes());
+                fast_extend_from_slice(buf, backptrs[backptr_idx as usize].hash.as_bytes());
             }
             i += 1;
         }
@@ -3889,13 +3944,18 @@ where
         let mut ptrs = c.node_ptrs.clone();
         test_debug!("update_root_hash: ptrs = {:?}", &ptrs);
         let mut child_ptr = ptrs.pop().unwrap();
-       
 
         while ptrs.len() > 0 {
             let ptr = match ptrs.pop() {
                 Some(p) => p,
                 None => panic!("Out of ptrs")
             };
+            if is_backptr(ptr.id()) {
+                // this node was not altered, but instead queued to the cursor as part of walking a
+                // backptr skiplist.  Do nothing.
+                continue;
+            }
+
             let (mut node, cur_hash) = Trie::read_node(s, &ptr)?;
 
             // this child_ptr _must_ be in the node.
@@ -3949,6 +4009,7 @@ where
             };
             
             child_ptr = ptr;
+            child_ptr.id = clear_backptr(child_ptr.id);
         }
 
         // must be at the root
@@ -3971,12 +4032,12 @@ where
 {
 
     // helper method for walking a node's backprs
-    fn walk_backptrs(s: &mut S, start_node: &TrieNodeType, c: u8) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
+    fn walk_backptrs(s: &mut S, start_node: &TrieNodeType, chr: u8, c: &mut TrieCursor) -> Result<(TrieNodeType, TrieHash, TriePtr), Error> {
         let ptr_opt = match start_node {
-            TrieNodeType::Node4(ref data) => data.walk(c),
-            TrieNodeType::Node16(ref data) => data.walk(c),
-            TrieNodeType::Node48(ref data) => data.walk(c),
-            TrieNodeType::Node256(ref data) => data.walk(c),
+            TrieNodeType::Node4(ref data) => data.walk(chr),
+            TrieNodeType::Node16(ref data) => data.walk(chr),
+            TrieNodeType::Node48(ref data) => data.walk(chr),
+            TrieNodeType::Node256(ref data) => data.walk(chr),
             _ => {
                 panic!("Did not get an intermediate node");
             }
@@ -3984,7 +4045,7 @@ where
         match ptr_opt {
             None => {
                 // this node never had a child for this chr
-                test_debug!("Failed to walk to '{}' from {:?}", c, start_node);
+                test_debug!("Failed to walk to '{}' from {:?}", chr, start_node);
                 Err(Error::BackptrNotFoundError)
             },
             Some(ptr) => {
@@ -3992,10 +4053,10 @@ where
                 
                 // this node had a child for this chr at one point
                 let (node, node_hash, node_ptr) = match start_node {
-                    TrieNodeType::Node4(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node16(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node48(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
-                    TrieNodeType::Node256(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr)?,
+                    TrieNodeType::Node4(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr, c)?,
+                    TrieNodeType::Node16(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr, c)?,
+                    TrieNodeType::Node48(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr, c)?,
+                    TrieNodeType::Node256(ref data) => Trie::walk_backptrs(s, data.backptrs(), &ptr, c)?,
                     _ => {
                         unreachable!();
                     }
@@ -4023,9 +4084,7 @@ where
         let mut cur_node_backptrs = Vec::with_capacity(prev_backptrs_len + 1);
 
         // first backptr is to prev_node
-        let prev_node_id = prev_node_ptr.id();
-        let prev_node_backptr = TriePtr::new(prev_node_id, prev_node_ptr.chr(), prev_node_ptr.ptr());
-        cur_node_backptrs.push(TrieBackPtr::new(&s.tell(), &prev_node_backptr, prev_node_hash));
+        cur_node_backptrs.push(TrieBackPtr::new(&s.tell(), prev_node_ptr, prev_node_hash));
 
         // keep skipping back until we can't find a node or find the first version of ourselves
         let mut bi = 0;
@@ -4116,11 +4175,11 @@ where
     /// Given a node, and the chr of one of its children, go find the last instance of that child in
     /// the MARF and copy it forward.  Update its ptrs to point to its descendents.
     /// s must point to the block hash in which this node lives, to which the child will be copied.
-    fn node_child_copy(s: &mut S, node: &TrieNodeType, chr: u8) -> Result<(TrieNodeType, TrieHash, TriePtr, BlockHeaderHash), Error> {
+    fn node_child_copy(s: &mut S, node: &TrieNodeType, chr: u8, c: &mut TrieCursor) -> Result<(TrieNodeType, TrieHash, TriePtr, BlockHeaderHash), Error> {
         test_debug!("Copy to {:?} child {:x} of {:?}", s.tell(), chr, node);
 
         let cur_block_hash = s.tell();
-        let (mut child_node, child_hash, child_ptr) = MARF::walk_backptrs(s, node, chr)?;
+        let (mut child_node, child_hash, child_ptr) = MARF::walk_backptrs(s, node, chr, c)?;
         let child_block_hash = s.tell();
         
         // s now points to the child's block hash.  Get its new backptrs
@@ -4244,7 +4303,7 @@ where
                         // at intermediate node whose child is not present in this trie.
                         // bring the child forward and take the step, if possible.
                         s.open(block_hash, true)?;
-                        let (next_node, next_node_hash, next_node_ptr, next_node_block_hash) = match MARF::node_child_copy(s, &node, chr) {
+                        let (next_node, next_node_hash, next_node_ptr, next_node_block_hash) = match MARF::node_child_copy(s, &node, chr, &mut c) {
                             Ok(res) => {
                                 res
                             }
@@ -4266,8 +4325,9 @@ where
                         };
 
                         // finish taking the step
-                        c.walk_backptr_resolved(&next_node_ptr, &next_node_block_hash);
-                        c.retarget(&next_node, &next_node_ptr, &s.tell());
+                        // let backptr_node_ptr = TriePtr::new(set_backptr(next_node_ptr.id()), next_node_ptr.chr(), next_node_ptr.ptr());
+                        c.walk_backptr_finish(&next_node_ptr, &next_node_block_hash);
+                        // c.retarget(&next_node, &backptr_node_ptr, &s.tell());
                         
                         node = next_node;
                         node_ptr = next_node_ptr;
@@ -4338,13 +4398,15 @@ where
                             return Ok((c, node));
                         }
 
+                        // cursor grabbed a copy of node, but not yet a ptr.
                         // at intermediate node whose child is not present in this trie.
                         // try to shunt to the prior node that has the child itself.
-                        let (next_node, next_node_hash, next_node_ptr) = MARF::walk_backptrs(s, &node, chr)?;
-                        
+                        let (next_node, next_node_hash, next_node_ptr) = MARF::walk_backptrs(s, &node, chr, &mut c)?;
+                       
                         // finish taking the step
-                        c.walk_backptr_resolved(&next_node_ptr, &s.tell());
-                        c.retarget(&next_node, &next_node_ptr, &s.tell());
+                        // let backptr_node_ptr = TriePtr::new(set_backptr(next_node_ptr.id()), next_node_ptr.chr(), next_node_ptr.ptr());
+                        c.walk_backptr_finish(&next_node_ptr, &s.tell());
+                        // c.retarget(&next_node, &backptr_node_ptr, &s.tell());
 
                         // keep going
                         node = next_node;
@@ -4414,6 +4476,7 @@ where
 
 #[derive(Clone)]
 pub enum TrieMerkleProofType {
+    // chr, node, sibling hashes (depth_1 > 0 implies that a backptr was taken)
     Node4((u8, TrieNode4, [TrieHash; 3])),
     Node16((u8, TrieNode16, [TrieHash; 15])),
     Node48((u8, TrieNode48, [TrieHash; 47])),
@@ -4432,11 +4495,11 @@ pub fn hashes_fmt(hashes: &[TrieHash]) -> String {
 impl fmt::Debug for TrieMerkleProofType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            TrieMerkleProofType::Node4((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node4({}, {:?}, {})", chr, node, hashes_fmt(hashes)),
-            TrieMerkleProofType::Node16((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node16({}, {:?}, {})", chr, node, hashes_fmt(hashes)),
-            TrieMerkleProofType::Node48((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node48({}, {:?}, {})", chr, node, hashes_fmt(hashes)),
-            TrieMerkleProofType::Node256((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node256({}, {:?}, {})", chr, node, hashes_fmt(hashes)),
-            TrieMerkleProofType::Leaf((ref chr, ref node)) => write!(f, "TrieMerkleProofType::Leaf({}, {:?})", chr, node),
+            TrieMerkleProofType::Node4((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node4(0x{:02x}, node={:?}, hashes={})", chr, node, hashes_fmt(hashes)),
+            TrieMerkleProofType::Node16((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node16(0x{:02x}, node={:?}, hashes={})", chr, node, hashes_fmt(hashes)),
+            TrieMerkleProofType::Node48((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node48(0x{:02x}, node={:?}, hashes={})", chr, node, hashes_fmt(hashes)),
+            TrieMerkleProofType::Node256((ref chr, ref node, ref hashes)) => write!(f, "TrieMerkleProofType::Node256(0x{:02x}, node={:?}, hashes={})", chr, node, hashes_fmt(hashes)),
+            TrieMerkleProofType::Leaf((ref chr, ref node)) => write!(f, "TrieMerkleProofType::Leaf(0x{:02x}, node={:?})", chr, node),
         }
     }
 }
@@ -4464,6 +4527,7 @@ impl PartialEq for TrieMerkleProofType {
     }
 }
 
+#[derive(Debug)]
 pub struct TrieMerkleProof(Vec<TrieMerkleProofType>);
 
 impl Deref for TrieMerkleProof {
@@ -4476,12 +4540,13 @@ impl Deref for TrieMerkleProof {
 impl TrieMerkleProof {
     /// Given a TriePtr to the _currently-visited_ node and the chr of the _previous_ node, calculate a
     /// Merkle proof node.  Include all the children hashes _except_ for the one that corresponds
-    /// to the previous node.  Does not handle backptrs.
-    fn ptr_to_proof_node<S: TrieStorage + Seek>(s: &mut S, ptr: &TriePtr, chr: u8) -> Result<TrieMerkleProofType, Error> {
-        let (node, node_hash) = Trie::read_node(s, &ptr)?;
+    /// to the previous node.
+    fn ptr_to_proof_node<S: TrieStorage + Seek>(s: &mut S, ptr: &TriePtr, prev_chr: u8) -> Result<TrieMerkleProofType, Error> {
+        test_debug!("ptr_to_proof_node: ptr={:?}, prev_chr=0x{:02x}", ptr, prev_chr);
+        let (node, _) = Trie::read_node(s, ptr)?;
         let all_hashes = Trie::get_children_hashes(s, &node)?;
 
-        fn make_proof_hash<T: TrieNode + std::fmt::Debug>(data: &T, all_hashes: &Vec<TrieHash>, chr: u8) -> Vec<TrieHash> {
+        fn make_proof_hashes<T: TrieNode + std::fmt::Debug>(data: &T, all_hashes: &Vec<TrieHash>, chr: u8) -> Vec<TrieHash> {
             let mut hashes = vec![];
             assert!(all_hashes.len() == data.ptrs().len());
 
@@ -4493,49 +4558,53 @@ impl TrieMerkleProof {
                     hashes.push(all_hashes[i].clone());
                 }
             }
-            assert_eq!(hashes.len(), data.ptrs().len() - 1);
+
+            if hashes.len() + 1 != data.ptrs().len() {
+                panic!(format!("Char 0x{:02x} does not appear in this node", chr));
+            }
+
             hashes
         }
-
+        
         let proof_node = match node {
             TrieNodeType::BackPtr(ref data) => {
                 // shouldn't happen anyway
                 return Err(Error::CorruptionError("Read a backptr node (shoudn't be possible)".to_string()));
             },
             TrieNodeType::Leaf(ref data) => {
-                TrieMerkleProofType::Leaf((chr, data.clone()))
+                TrieMerkleProofType::Leaf((prev_chr, data.clone()))
             },
             TrieNodeType::Node4(ref data) => {
-                let hashes = make_proof_hash(data, &all_hashes, chr);
+                let hashes = make_proof_hashes(data, &all_hashes, prev_chr);
 
                 let mut hash_slice = [TrieHash::from_data(&[]); 3];
                 hash_slice.copy_from_slice(&hashes[0..3]);
 
-                TrieMerkleProofType::Node4((chr, data.clone(), hash_slice))
+                TrieMerkleProofType::Node4((prev_chr, data.clone(), hash_slice))
             },
             TrieNodeType::Node16(ref data) => {
-                let hashes = make_proof_hash(data, &all_hashes, chr);
+                let hashes = make_proof_hashes(data, &all_hashes, prev_chr);
                 
                 let mut hash_slice = [TrieHash::from_data(&[]); 15];
                 hash_slice.copy_from_slice(&hashes[0..15]);
 
-                TrieMerkleProofType::Node16((chr, data.clone(), hash_slice))
+                TrieMerkleProofType::Node16((prev_chr, data.clone(), hash_slice))
             },
             TrieNodeType::Node48(ref data) => {
-                let hashes = make_proof_hash(data, &all_hashes, chr);
+                let hashes = make_proof_hashes(data, &all_hashes, prev_chr);
                 
                 let mut hash_slice = [TrieHash::from_data(&[]); 47];
                 hash_slice.copy_from_slice(&hashes[0..47]);
 
-                TrieMerkleProofType::Node48((chr, data.clone(), hash_slice))
+                TrieMerkleProofType::Node48((prev_chr, data.clone(), hash_slice))
             },
             TrieNodeType::Node256(ref data) => {
-                let hashes = make_proof_hash(data, &all_hashes, chr);
+                let hashes = make_proof_hashes(data, &all_hashes, prev_chr);
 
                 let mut hash_slice = [TrieHash::from_data(&[]); 255];
                 hash_slice.copy_from_slice(&hashes[0..255]);
 
-                TrieMerkleProofType::Node256((chr, data.clone(), hash_slice))
+                TrieMerkleProofType::Node256((prev_chr, data.clone(), hash_slice))
             }
         };
         Ok(proof_node)
@@ -4550,8 +4619,11 @@ impl TrieMerkleProof {
         let mut block_hashes = c.block_hashes.clone();
         let mut proof = vec![];
         let mut ptr = TriePtr::new(0,0,0);
-        let mut chr = c.chr().unwrap();
-        
+        let mut prev_chr = 0;
+      
+        test_debug!("Cursor to proof: ptrs={:?}", &ptrs);
+        test_debug!("Cursor to proof: blocks={:?}", &block_hashes);
+
         while ptrs.len() > 0 {
             ptr = match ptrs.pop() {
                 Some(p) => p,
@@ -4569,9 +4641,15 @@ impl TrieMerkleProof {
                 }
             };
 
-            let proof_node = TrieMerkleProof::ptr_to_proof_node(s, &ptr, chr)?;
+            let proof_node = TrieMerkleProof::ptr_to_proof_node(s, &ptr, prev_chr)?;
+
+            test_debug!("Add proof node from {:?} (child 0x{:02x}): {:?}", &ptr, prev_chr, &proof_node);
+
             proof.push(proof_node);
-            chr = ptr.chr();
+
+            if !is_backptr(ptr.id()) {
+                prev_chr = ptr.chr();
+            }
         }
         
         // must have ended on root 
@@ -4610,8 +4688,10 @@ impl TrieMerkleProof {
                     test_debug!("verify_get_hash: {} >= {}", ih, hashes.len());
                     return None;
                 }
-                all_hashes.push(hashes[ih].clone());
-                ih += 1;
+                else {
+                    all_hashes.push(hashes[ih].clone());
+                    ih += 1;
+                }
             }
         }
         if all_hashes.len() != count {
@@ -4621,57 +4701,36 @@ impl TrieMerkleProof {
 
         Some(get_node_hash(node, &all_hashes))
     }
-
-    pub fn verify(&self, path: &TriePath, value: &TrieLeaf, root_hash: &TrieHash) -> bool {
+    
+    pub fn verify(&self, value: &TrieLeaf, root_hash: &TrieHash) -> bool {
         let mut hash = get_node_hash(value, &vec![]);
+        let mut prev_hash = hash.clone();
         for j in 0..self.0.len() {
-            let next_hash = match self.0[j] {
+            let hash_opt = match self.0[j] {
                 TrieMerkleProofType::Leaf((ref chr, ref node)) => {
-                    let hopt = TrieMerkleProof::verify_get_hash(node, &hash, *chr, &vec![], 0);
-                    match hopt {
-                        None => {
-                            return false;
-                        },
-                        Some(h) => h
-                    }
+                    TrieMerkleProof::verify_get_hash(node, &hash, *chr, &vec![], 0)
                 },
                 TrieMerkleProofType::Node4((ref chr, ref node, ref hashes)) => {
-                    let hopt = TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 4);
-                    match hopt {
-                        None => {
-                            return false;
-                        },
-                        Some(h) => h
-                    }
+                    TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 4)
                 },
                 TrieMerkleProofType::Node16((ref chr, ref node, ref hashes)) => {
-                    let hopt = TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 16);
-                    match hopt {
-                        None => {
-                            return false;
-                        }
-                        Some(h) => h
-                    }
+                    TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 16)
                 },
                 TrieMerkleProofType::Node48((ref chr, ref node, ref hashes)) => {
-                    let hopt = TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 48);
-                    match hopt {
-                        None => {
-                            return false;
-                        }
-                        Some(h) => h
-                    }
-                },
+                    TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 48)
+                }
                 TrieMerkleProofType::Node256((ref chr, ref node, ref hashes)) => {
-                    let hopt = TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 256);
-                    match hopt {
-                        None => {
-                            return false;
-                        }
-                        Some(h) => h
-                    }
-                },
+                    TrieMerkleProof::verify_get_hash(node, &hash, *chr, hashes, 256)
+                }
             };
+            let mut next_hash = match hash_opt {
+                None => {
+                    return false;
+                }
+                Some(h) => h.clone()
+            };
+
+            prev_hash = hash;
             hash = next_hash;
         }
 
@@ -4823,18 +4882,26 @@ mod test {
         s.open(&block_header, false).unwrap();
 
         let proof = TrieMerkleProof::from_path(s, &triepath).unwrap();
-        assert!(proof.verify(&triepath, &value_leaf, &root_hash));
+        assert!(proof.verify(&value_leaf, &root_hash));
     }
     
     fn merkle_test_marf<S: TrieStorage + Seek>(s: &mut S, header: &BlockHeaderHash, path: &Vec<u8>, value: &Vec<u8>) -> () {
-        test_debug!("merkle_test_marf({:?}, {:?}, {:?})?", header, path, value);
+
+        test_debug!("---------");
+        test_debug!("MARF merkle prove: merkle_test_marf({:?}, {:?}, {:?})?", header, path, value);
+        test_debug!("---------");
+
         s.open(header, false).unwrap();
         let (_, root_hash) = Trie::read_root(s).unwrap();
         let triepath = TriePath::from_bytes(&path[..]).unwrap();
         let value_leaf = TrieLeaf::new(&vec![], &value);
-
         let proof = TrieMerkleProof::from_path(s, &triepath).unwrap();
-        assert!(proof.verify(&triepath, &value_leaf, &root_hash));
+
+        test_debug!("---------");
+        test_debug!("MARF merkle verify: {:?}", &proof);
+        test_debug!("---------");
+
+        assert!(proof.verify(&value_leaf, &root_hash));
     }
 
     #[test]
@@ -8506,6 +8573,45 @@ mod test {
     }
     
     #[test]
+    fn marf_insert_leaf_sequence_2() {
+        let cursor = Cursor::new(vec![]);
+        let mut f = TrieIOBuffer::new(cursor);
+
+        let block_header_1 = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
+        MARF::format(&mut f, &block_header_1).unwrap();
+
+        for i in 0..2 {
+            let path_bytes = [i as u8,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+            let path = TriePath::from_bytes(&path_bytes).unwrap();
+
+            let next_block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            MARF::insert(&mut f, &next_block_header, &path, &value).unwrap();
+        }
+        
+        let last_block_header = BlockHeaderHash::from_bytes(&[1; 32]).unwrap();
+
+        test_debug!("---------");
+        test_debug!("MARF gets");
+        test_debug!("---------");
+
+        for i in 0..2 {
+            let next_block_header = BlockHeaderHash::from_bytes(&[i as u8; 32]).unwrap();
+            let path_bytes = [i as u8,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+            let path = TriePath::from_bytes(&path_bytes).unwrap();
+            
+            let value = TrieLeaf::new(&vec![], &[i as u8; 40].to_vec());
+            let leaf = MARF::get(&mut f, &last_block_header, &path).unwrap().unwrap();
+
+            assert_eq!(leaf.reserved.to_vec(), [i as u8; 40].to_vec());
+            assert_eq!(f.tell(), next_block_header);
+            assert_eq!(leaf.backptrs.len(), 0);
+
+            merkle_test_marf(&mut f, &last_block_header, &path_bytes.to_vec(), &[i as u8; 40].to_vec());
+        }
+    }
+    
+    #[test]
     fn marf_insert_leaf_sequence_100() {
         let cursor = Cursor::new(vec![]);
         let mut f = TrieIOBuffer::new(cursor);
@@ -8926,6 +9032,70 @@ mod test {
                 
                 merkle_test_marf(&mut f, &last_block_header, &next_path, &[i as u8; 40].to_vec());
             }
+        }
+    }
+    
+    #[test]
+    fn marf_merkle_verify_backptrs() {
+        for node_id in [TrieNodeID::Node4, TrieNodeID::Node16, TrieNodeID::Node48, TrieNodeID::Node256].iter() {
+            let cursor = Cursor::new(vec![]);
+            let mut f = TrieIOBuffer::new(cursor);
+
+            let block_header_1 = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
+            MARF::format(&mut f, &block_header_1).unwrap();
+
+            let path_segments = vec![
+                (vec![0,1,2,3,4,5,6,7,8,9,10,11], 12),
+                (vec![13,14,15,16,17,18], 19),
+            ];
+            
+            let path = vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19];
+
+            let (nodes, node_ptrs, hashes) = make_node_path(&mut f, *node_id, &path_segments, [19u8; 40].to_vec());
+            dump_trie(&mut f);
+
+            let block_header_2 = BlockHeaderHash::from_bytes(&[1u8; 32]).unwrap();
+            let path_2 = vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20];
+            
+            test_debug!("----------------");
+            test_debug!("Extend to {:?}", block_header_2);
+            test_debug!("----------------");
+
+            MARF::insert(&mut f, &block_header_2, &TriePath::from_bytes(&path_2[..]).unwrap(), &TrieLeaf::new(&vec![], &[20 as u8; 40].to_vec())).unwrap();
+            
+            let block_header_3 = BlockHeaderHash::from_bytes(&[2u8; 32]).unwrap();
+            let path_3 = vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,21];
+            
+            test_debug!("----------------");
+            test_debug!("Extend to {:?}", block_header_3);
+            test_debug!("----------------");
+
+            MARF::insert(&mut f, &block_header_3, &TriePath::from_bytes(&path_3[..]).unwrap(), &TrieLeaf::new(&vec![], &[21 as u8; 40].to_vec())).unwrap();
+
+            test_debug!("----------------");
+            test_debug!("MARF at {:?}", &block_header_1);
+            test_debug!("----------------");
+            f.open(&block_header_1, false).unwrap();
+            dump_trie(&mut f);
+
+            test_debug!("----------------");
+            test_debug!("MARF at {:?}", &block_header_2);
+            test_debug!("----------------");
+            f.open(&block_header_2, false).unwrap();
+            dump_trie(&mut f);
+
+
+            test_debug!("----------------");
+            test_debug!("MARF at {:?}", &block_header_3);
+            test_debug!("----------------");
+            f.open(&block_header_3, false).unwrap();
+            dump_trie(&mut f);
+
+            test_debug!("----------------");
+            test_debug!("Merkle verify {:?} from {:?}", &to_hex(&[21 as u8; 40]), block_header_3);
+            test_debug!("----------------");
+
+            merkle_test_marf(&mut f, &block_header_3, &path_3, &[21 as u8; 40].to_vec());
         }
     }
 
@@ -9459,7 +9629,7 @@ mod test {
             assert_eq!(f.tell(), block_header);
             
             // can make a merkle proof to each one
-            // merkle_test_marf(&mut f, &block_header, &path.to_vec(), &value.reserved.to_vec());
+            merkle_test_marf(&mut f, &block_header, &path.to_vec(), &value.reserved.to_vec());
         }
         
         f.flush().unwrap();
