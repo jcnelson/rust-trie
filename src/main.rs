@@ -1,13 +1,13 @@
 #![allow(unused_imports)]
-#![allow(unused_assignments)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
 extern crate sha2;
 extern crate rand;
+
+// this is about 10x faster than std::collections::HashMap, and is part of the rust-lang org
+extern crate hashbrown;
 
 #[macro_use] mod util;
 
